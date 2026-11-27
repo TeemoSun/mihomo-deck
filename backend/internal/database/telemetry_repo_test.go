@@ -40,3 +40,54 @@ func TestTrafficResetAndAverage(t *testing.T) {
 		t.Fatalf("summary: %+v", summary)
 	}
 }
+
+func TestTrafficTotalsBatchAndRollback(t *testing.T) {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	totals := []TrafficTotal{{100, 200}, {150, 250}, {5, 20}, {10, 30}}
+	if err = RecordTrafficTotalsBatch(db, []TrafficSample{{TS: now.Unix(), UpBPS: 9}}, totals, now); err != nil {
+		t.Fatal(err)
+	}
+	var up, down, lastUp, lastDown int64
+	if err = db.QueryRow("SELECT cumulative_up,cumulative_down,last_up_total,last_down_total FROM traffic_cursor").Scan(&up, &down, &lastUp, &lastDown); err != nil {
+		t.Fatal(err)
+	}
+	if up != 160 || down != 280 || lastUp != 10 || lastDown != 30 {
+		t.Fatalf("cursor: %d %d %d %d", up, down, lastUp, lastDown)
+	}
+	if _, err = db.Exec(`CREATE TRIGGER reject_cursor BEFORE UPDATE ON traffic_cursor BEGIN SELECT RAISE(ABORT, 'rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err = RecordTrafficTotalsBatch(db, []TrafficSample{{TS: now.Unix() + 1}}, []TrafficTotal{{20, 40}}, now); err == nil {
+		t.Fatal("expected failure")
+	}
+	var count int
+	if err = db.QueryRow("SELECT count(*) FROM traffic_samples").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("samples after rollback: %d, %v", count, err)
+	}
+}
+
+func TestQueryConnectionsSearchesRule(t *testing.T) {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err = InsertClosedConnections(db, []ClosedConnection{{ID: "a", Rule: "DOMAIN-SUFFIX"}, {ID: "b", Rule: "MATCH"}}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := QueryConnections(db, ConnectionFilter{Q: "SUFFIX"})
+	if err != nil || result.Total != 1 || len(result.Items) != 1 || result.Items[0].ID != "a" {
+		t.Fatalf("result %+v: %v", result, err)
+	}
+}

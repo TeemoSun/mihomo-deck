@@ -14,7 +14,20 @@ type TrafficSample struct {
 	ActiveConns int64 `json:"activeConns"`
 }
 
+type TrafficTotal struct {
+	Up   int64
+	Down int64
+}
+
 func RecordTrafficBatch(db *sql.DB, samples []TrafficSample, up, down int64, hasTotals bool, now time.Time) error {
+	var totals []TrafficTotal
+	if hasTotals {
+		totals = append(totals, TrafficTotal{Up: up, Down: down})
+	}
+	return RecordTrafficTotalsBatch(db, samples, totals, now)
+}
+
+func RecordTrafficTotalsBatch(db *sql.DB, samples []TrafficSample, totals []TrafficTotal, now time.Time) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -39,7 +52,8 @@ func RecordTrafficBatch(db *sql.DB, samples []TrafficSample, up, down int64, has
 			return err
 		}
 	}
-	if hasTotals {
+	for _, total := range totals {
+		up, down := total.Up, total.Down
 		var lastUp, lastDown, cumUp, cumDown int64
 		err = tx.QueryRow("SELECT last_up_total,last_down_total,cumulative_up,cumulative_down FROM traffic_cursor WHERE id=1").Scan(&lastUp, &lastDown, &cumUp, &cumDown)
 		if err != nil && err != sql.ErrNoRows {

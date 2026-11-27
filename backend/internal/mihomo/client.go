@@ -89,6 +89,9 @@ func delayQuery(testURL string, timeout int) string {
 func (c *Client) TestProxyDelay(ctx context.Context, name, testURL string, timeoutMS int) (json.RawMessage, error) {
 	return c.request(ctx, http.MethodGet, "/proxies/"+url.PathEscape(name)+"/delay?"+delayQuery(testURL, timeoutMS), nil)
 }
+func (c *Client) TestProviderProxyDelay(ctx context.Context, provider, name, testURL string, timeoutMS int) (json.RawMessage, error) {
+	return c.request(ctx, http.MethodGet, "/providers/proxies/"+url.PathEscape(provider)+"/"+url.PathEscape(name)+"/healthcheck?"+delayQuery(testURL, timeoutMS), nil)
+}
 func (c *Client) TestGroupDelay(ctx context.Context, group, testURL string, timeoutMS int) (json.RawMessage, error) {
 	return c.request(ctx, http.MethodGet, "/group/"+url.PathEscape(group)+"/delay?"+delayQuery(testURL, timeoutMS), nil)
 }

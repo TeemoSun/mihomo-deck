@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Tabs } from '../components/ui';
 import { formatUnixTime } from '../lib/format';
+import { usePrefsStore } from '../stores/usePrefsStore';
 import { useLiveStore } from '../stores/useLiveStore';
 import { useToastStore } from '../stores/useToastStore';
 import type { PagedLogs } from '../types/api';
@@ -20,6 +21,7 @@ export default function LogsPage() {
     setLogsPaused
   } = useLiveStore();
   const toast = useToastStore();
+  const prefs = usePrefsStore(s => s.prefs);
   useEffect(() => {
     if (tab !== 'history') return;
     void api.logs({
@@ -59,6 +61,7 @@ export default function LogsPage() {
           {logsPaused ? '恢复日志' : '暂停日志'}
         </Button> : <Button onClick={() => setConfirm(true)}>清空历史日志</Button>}
       </div>
+      {tab === 'live' && level === 'debug' && prefs?.logPersistLevel !== 'debug' && <div className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-700 dark:border-indigo-900 dark:bg-indigo-950/40 dark:text-indigo-300">查看 debug 日志需要在内核设置中将“日志持久化级别”设为 debug。</div>}
       <Card className="overflow-hidden">
         {entries.map((entry, index) => <div key={`${entry.id}-${index}`} className="flex items-start gap-2 border-b border-zinc-100 p-3 text-xs dark:border-zinc-800">
           <span className="whitespace-nowrap font-mono text-zinc-500">

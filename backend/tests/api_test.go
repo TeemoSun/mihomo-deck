@@ -23,8 +23,10 @@ import (
 
 func TestAuthAndProxy(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/proxies/节点 😀/delay" {
-			t.Errorf("upstream path %q", r.URL.Path)
+		switch r.URL.EscapedPath() {
+		case "/proxies/%E8%8A%82%E7%82%B9%20%F0%9F%98%80/delay", "/proxies/HK%2F01%20%F0%9F%98%80/delay", "/proxies/HK%2F01%20%F0%9F%98%80", "/proxies/100%25/delay":
+		default:
+			t.Errorf("upstream path %q", r.URL.EscapedPath())
 		}
 		_, _ = w.Write([]byte(`{"delay":42}`))
 	}))
@@ -81,6 +83,22 @@ func TestAuthAndProxy(t *testing.T) {
 	records, err := database.QueryDelays(db, "", time.Unix(0, 0), 10)
 	if err != nil || len(records) != 1 || records[0].ProxyName != "节点 😀" {
 		t.Fatalf("delays: %+v %v", records, err)
+	}
+	for _, name := range []string{"HK/01 😀", "100%"} {
+		rec := request("GET", "/api/mihomo/proxies/"+url.PathEscape(name)+"/delay", false)
+		if rec.Code != 200 {
+			t.Fatalf("delay %q: %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	selectReq := httptest.NewRequest("PUT", "/api/mihomo/proxies/"+url.PathEscape("HK/01 😀"), strings.NewReader(`{"name":"node"}`))
+	for _, cookie := range cookies {
+		selectReq.AddCookie(cookie)
+	}
+	selectReq.Header.Set("X-CSRF-Token", body.CSRF)
+	selected := httptest.NewRecorder()
+	h.ServeHTTP(selected, selectReq)
+	if selected.Code != 200 {
+		t.Fatalf("select: %d %s", selected.Code, selected.Body.String())
 	}
 	refresh := request("POST", "/api/auth/refresh", false)
 	if refresh.Code != 200 {
@@ -451,6 +469,78 @@ func TestLiveTrafficStream(t *testing.T) {
 				t.Fatalf("event %s", event.Data)
 			}
 			found = true
+		}
+	}
+}
+
+func TestProviderProxyDelay(t *testing.T) {
+	var paths []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath())
+		switch r.URL.EscapedPath() {
+		case "/proxies/node/delay":
+			http.NotFound(w, r)
+		case "/providers/proxies":
+			_, _ = w.Write([]byte(`{"providers":{"default":{"vehicleType":"Compatible","proxies":[{"name":"node","provider-name":"wrong"}]},"sub":{"vehicleType":"HTTP","proxies":[{"name":"node"}]}}}`))
+		case "/providers/proxies/sub/node/healthcheck":
+			if r.URL.Query().Get("url") != "https://example.test/check?a=1" || r.URL.Query().Get("timeout") != "1234" {
+				t.Errorf("query: %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"delay":42}`))
+		default:
+			t.Errorf("unexpected upstream path %s", r.URL.EscapedPath())
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	db, err := database.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.EnsureAdminSeed(db, "admin", "good-password"); err != nil {
+		t.Fatal(err)
+	}
+	client := mihomo.NewClient(up.URL, "")
+	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
+	login := httptest.NewRecorder()
+	h.ServeHTTP(login, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
+	if login.Code != http.StatusOK {
+		t.Fatalf("login: %d", login.Code)
+	}
+	for _, provider := range []string{"sub", ""} {
+		paths = nil
+		query := url.Values{"url": {"https://example.test/check?a=1"}, "timeout": {"1234"}}
+		if provider != "" {
+			query.Set("provider", provider)
+		}
+		req := httptest.NewRequest("GET", "/api/mihomo/proxies/node/delay?"+query.Encode(), nil)
+		for _, cookie := range login.Result().Cookies() {
+			req.AddCookie(cookie)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || rec.Body.String() != `{"delay":42}` {
+			t.Fatalf("provider %q: %d %s", provider, rec.Code, rec.Body.String())
+		}
+		want := "/providers/proxies/sub/node/healthcheck"
+		if provider == "" {
+			want = "/proxies/node/delay,/providers/proxies," + want
+		}
+		if got := strings.Join(paths, ","); got != want {
+			t.Fatalf("provider %q: paths %s", provider, got)
+		}
+	}
+	records, err := database.QueryDelays(db, "node", time.Unix(0, 0), 10)
+	if err != nil || len(records) != 2 {
+		t.Fatalf("delay records: %+v %v", records, err)
+	}
+	for _, record := range records {
+		if record.DelayMS != 42 || !record.OK || record.Source != "manual" || record.TestURL != "https://example.test/check?a=1" {
+			t.Errorf("delay record: %+v", record)
 		}
 	}
 }

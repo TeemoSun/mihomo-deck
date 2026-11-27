@@ -6,7 +6,7 @@ import { usePrefsStore } from '../stores/usePrefsStore';
 import { useLiveStore } from '../stores/useLiveStore';
 import { useToastStore } from '../stores/useToastStore';
 import { formatBytes, formatSpeed, formatRelative, formatUnixTime } from '../lib/format';
-import { Button, Card, EmptyState, Modal, Select, Tabs } from '../components/ui';
+import { Badge, Button, Card, EmptyState, Modal, Select, Tabs } from '../components/ui';
 import ModeSwitcher from '../components/ModeSwitcher';
 export default function OverviewPage() {
   const [data, setData] = useState<OverviewResponse | null>(null);
@@ -16,10 +16,12 @@ export default function OverviewPage() {
   const [proxies, setProxies] = useState<Record<string, ProxyItem>>({});
   const [history, setHistory] = useState<ProviderSnapshot[] | null>(null);
   const [providerName, setProviderName] = useState('');
+  const prefs = usePrefsStore(s => s.prefs);
   const autoRefresh = usePrefsStore(s => s.prefs?.autoRefreshOverview);
   const live = useLiveStore();
   const toast = useToastStore();
   const load = () => {
+    if (range !== 'live') void api.traffic(range).then(setSeries).catch(() => toast.error('加载流量历史失败'));
     void api.overview().then(setData).catch(() => toast.error('加载概览失败'));
     void api.proxies().then(x => setProxies(x.proxies)).catch(() => {});
   };
@@ -28,10 +30,7 @@ export default function OverviewPage() {
     if (autoRefresh === false) return;
     const id = setInterval(load, 60000);
     return () => clearInterval(id);
-  }, [autoRefresh]);
-  useEffect(() => {
-    if (range !== 'live') void api.traffic(range).then(setSeries).catch(() => toast.error('加载流量历史失败'));
-  }, [range]);
+  }, [autoRefresh, range]);
   const points = range === 'live' ? live.samples : series.map(p => ({
     ...p,
     upBps: p.upBps || p.peakUpBps,
@@ -39,7 +38,7 @@ export default function OverviewPage() {
     memInuse: p.memInuse || p.avgMem
   }));
   const sum = data?.trafficSummary;
-  const groups = Object.values(proxies).filter(p => ['Selector', 'URLTest'].includes(p.type) && p.all?.length);
+  const groups = Object.values(proxies).filter(p => ['Selector', 'URLTest'].includes(p.type) && p.all?.length && !prefs?.hiddenGroups.includes(p.name) && (p.name !== 'GLOBAL' || data?.configs?.mode?.toLowerCase() === 'global')).sort((a, b) => Number(b.type === 'Selector') - Number(a.type === 'Selector'));
   const stats = data?.topStats;
   return <div className="space-y-6">
       <div>
@@ -47,14 +46,16 @@ export default function OverviewPage() {
         <p className="mt-1 text-sm text-zinc-500">运行状态与流量概况</p>
       </div>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        {[['实时速率', `↑ ${formatSpeed(live.traffic.up)}  ↓ ${formatSpeed(live.traffic.down)}`], ['内存占用', `${formatBytes(live.memory.inuse)} / ${live.memory.oslimit ? formatBytes(live.memory.oslimit) : '不限'}`], ['活跃连接数', String(live.connections.length)], ['今日流量', formatBytes((sum?.todayUp || 0) + (sum?.todayDown || 0))], ['近 7 天流量', formatBytes((sum?.weekUp || 0) + (sum?.weekDown || 0))], ['近 30 天流量', formatBytes((sum?.monthUp || 0) + (sum?.monthDown || 0))], ['跨重启累计流量', formatBytes((sum?.cumulativeUp || 0) + (sum?.cumulativeDown || 0))]].map(([label, value]) => <Card key={label} className="p-4">
-          <div className="text-xs text-zinc-500">
-            {label}
-          </div>
-          <div className="mt-2 text-lg font-semibold">
-            {value}
-          </div>
-        </Card>)}
+        {[
+          { label: '实时速率', value: formatSpeed(live.traffic.up + live.traffic.down), detail: `↑ ${formatSpeed(live.traffic.up)} · ↓ ${formatSpeed(live.traffic.down)}` },
+          { label: '内存占用', value: formatBytes(live.memory.inuse), detail: `上限 ${live.memory.oslimit ? formatBytes(live.memory.oslimit) : '不限'}` },
+          { label: '活跃连接数', value: String(live.connections.length) },
+          { label: '上游核心', value: live.status?.connected ? '已连接' : '离线', detail: live.status?.version || '版本未知' },
+          { label: '今日流量', value: formatBytes((sum?.todayUp || 0) + (sum?.todayDown || 0)), detail: `↑ ${formatBytes(sum?.todayUp || 0)} · ↓ ${formatBytes(sum?.todayDown || 0)}` },
+          { label: '近 7 天流量', value: formatBytes((sum?.weekUp || 0) + (sum?.weekDown || 0)) },
+          { label: '近 30 天流量', value: formatBytes((sum?.monthUp || 0) + (sum?.monthDown || 0)) },
+          { label: '跨重启累计流量', value: formatBytes((sum?.cumulativeUp || 0) + (sum?.cumulativeDown || 0)), detail: `↑ ${formatBytes(sum?.cumulativeUp || 0)} · ↓ ${formatBytes(sum?.cumulativeDown || 0)}` }
+        ].map(({label, value, detail}) => <Card key={label} className="p-4"><div className="text-xs text-zinc-500">{label}</div><div className="mt-2 text-lg font-semibold">{value}</div>{detail && <div className="mt-1 text-xs text-zinc-500">{detail}</div>}</Card>)}
       </div>
       <Card className="p-4">
         <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -90,13 +91,10 @@ export default function OverviewPage() {
           {points.length ? <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={points}>
               <CartesianGrid strokeDasharray="3 3" strokeOpacity={0.12} />
-              <XAxis dataKey="ts" tickFormatter={v => new Date(v * 1000).toLocaleTimeString('zh-CN', {
-              hour: '2-digit',
-              minute: '2-digit'
-            })} tick={{
+              <XAxis dataKey="ts" tickFormatter={v => (['7d', '30d'].includes(range) ? new Date(v * 1000).toLocaleDateString('zh-CN', {month:'2-digit', day:'2-digit'}) + ' ' : '') + new Date(v * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit', hour12:false})} tick={{
               fontSize: 10
             }} minTickGap={35} />
-              <YAxis tickFormatter={formatBytes} tick={{
+              <YAxis tickFormatter={chart === 'network' && !['7d', '30d'].includes(range) ? formatSpeed : formatBytes} tick={{
               fontSize: 10
             }} width={70} />
               <Tooltip labelFormatter={v => formatUnixTime(Number(v))} formatter={(v, name) => [chart === 'network' && !['7d', '30d'].includes(range) ? formatSpeed(Number(v)) : formatBytes(Number(v)), name]} />
@@ -130,6 +128,7 @@ export default function OverviewPage() {
                 {n}
               </option>)}
             </Select>
+            {g.fixed && <><Badge>已固定</Badge><Button onClick={() => void api.unfixProxy(g.name).then(load).catch(() => toast.error('取消固定失败'))}>取消固定</Button></>}
             <Button onClick={() => void api.testGroup(g.name).then(() => {
             toast.success('测速完成');
             load();
@@ -165,7 +164,7 @@ export default function OverviewPage() {
               <span>已用 {formatBytes(used)} / {s.Total ? formatBytes(s.Total) : '未知'}</span>
               <span>剩余 {s.Total ? formatBytes(Math.max(0, s.Total - used)) : '未知'}</span>
             </div>
-            <div className="mt-3 text-xs text-zinc-500">到期：{s.Expire ? formatRelative(s.Expire) : '未知'} · 可用节点 {(p.proxies || []).filter(n => n.alive).length} / {(p.proxies || []).length}</div>
+            <div className="mt-3 text-xs text-zinc-500">到期：<span title={s.Expire ? formatUnixTime(s.Expire) : undefined}>{s.Expire ? formatRelative(s.Expire) : '未知'}</span> · 可用节点 {(p.proxies || []).filter(n => n.alive).length} / {(p.proxies || []).length}</div>
           </Card>;
         })}
         </div>
@@ -183,7 +182,7 @@ export default function OverviewPage() {
                 {x.name}
               </span>
               <span className="whitespace-nowrap text-zinc-500">
-                {formatBytes(x.bytes)}
+                {formatBytes(x.bytes)} · {x.count} 次
               </span>
             </div>) : <EmptyState>暂无数据</EmptyState>}
           </Card>)}

@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -41,8 +42,8 @@ func (s *Server) proxyRouter() http.Handler {
 }
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	name := chi.URLParam(r, "name")
-	id := chi.URLParam(r, "id")
+	name := proxyParam(r, "name")
+	id := proxyParam(r, "id")
 	pattern := chi.RouteContext(ctx).RoutePattern()
 	var data json.RawMessage
 	var err error
@@ -106,7 +107,48 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 				_ = database.InsertDelays(s.db, records)
 			}
 		} else {
-			data, err = c.TestProxyDelay(ctx, name, testURL, timeout)
+			provider := r.URL.Query().Get("provider")
+			if provider != "" {
+				data, err = c.TestProviderProxyDelay(ctx, provider, name, testURL, timeout)
+			} else {
+				data, err = c.TestProxyDelay(ctx, name, testURL, timeout)
+				var upstream *mihomo.UpstreamError
+				if errors.As(err, &upstream) && upstream.StatusCode == http.StatusNotFound {
+					if providers, e := c.ProxyProviders(ctx); e == nil {
+						var result struct {
+							Providers map[string]struct {
+								VehicleType string `json:"vehicleType"`
+								Proxies     []struct {
+									Name         string `json:"name"`
+									ProviderName string `json:"provider-name"`
+								} `json:"proxies"`
+							} `json:"providers"`
+						}
+						if json.Unmarshal(providers, &result) == nil {
+							for key, p := range result.Providers {
+								if p.VehicleType == "Compatible" {
+									continue
+								}
+								for _, node := range p.Proxies {
+									if node.Name == name {
+										provider = node.ProviderName
+										if provider == "" {
+											provider = key
+										}
+										break
+									}
+								}
+								if provider != "" {
+									break
+								}
+							}
+							if provider != "" {
+								data, err = c.TestProviderProxyDelay(ctx, provider, name, testURL, timeout)
+							}
+						}
+					}
+				}
+			}
 			var v struct {
 				Delay int64 `json:"delay"`
 			}
@@ -166,4 +208,15 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(data)
+}
+
+// Chi matches RawPath when it is present, so its parameters still need decoding.
+func proxyParam(r *http.Request, key string) string {
+	value := chi.URLParam(r, key)
+	if r.URL.RawPath != "" {
+		if decoded, err := url.PathUnescape(value); err == nil {
+			return decoded
+		}
+	}
+	return value
 }

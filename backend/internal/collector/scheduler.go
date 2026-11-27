@@ -49,13 +49,16 @@ func (c *Collector) capture(ctx context.Context) {
 		if json.Unmarshal(raw, &v) == nil {
 			c.mu.Lock()
 			c.state.Status.Version = v.Version
+			c.broadcast("status", c.state.Status)
 			c.mu.Unlock()
 		}
 	}
+	providerByProxy := map[string]string{}
 	raw, err = c.client.ProxyProviders(ctx)
 	if err == nil {
 		var data struct {
 			Providers map[string]struct {
+				VehicleType      string `json:"vehicleType"`
 				SubscriptionInfo struct {
 					Upload   int64 `json:"Upload"`
 					Download int64 `json:"Download"`
@@ -63,15 +66,25 @@ func (c *Collector) capture(ctx context.Context) {
 					Expire   int64 `json:"Expire"`
 				} `json:"subscriptionInfo"`
 				Proxies []struct {
-					Alive bool `json:"alive"`
+					Name         string `json:"name"`
+					ProviderName string `json:"provider-name"`
+					Alive        bool   `json:"alive"`
 				} `json:"proxies"`
 			} `json:"providers"`
 		}
 		if json.Unmarshal(raw, &data) == nil {
 			var out []database.ProviderSnapshot
 			for name, p := range data.Providers {
+				if p.VehicleType == "Compatible" {
+					continue
+				}
 				alive := int64(0)
 				for _, node := range p.Proxies {
+					provider := node.ProviderName
+					if provider == "" {
+						provider = name
+					}
+					providerByProxy[node.Name] = provider
 					if node.Alive {
 						alive++
 					}
@@ -107,7 +120,11 @@ func (c *Collector) capture(ctx context.Context) {
 			continue
 		}
 		seen[name] = true
-		raw, err = c.client.TestProxyDelay(ctx, name, p.DelayTestURL, p.DelayTestTimeout)
+		if prov, ok := providerByProxy[name]; ok && prov != "" {
+			raw, err = c.client.TestProviderProxyDelay(ctx, prov, name, p.DelayTestURL, p.DelayTestTimeout)
+		} else {
+			raw, err = c.client.TestProxyDelay(ctx, name, p.DelayTestURL, p.DelayTestTimeout)
+		}
 		var result struct {
 			Delay int64 `json:"delay"`
 		}

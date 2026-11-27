@@ -193,14 +193,20 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	ip := s.ip(r)
 	s.mu.Lock()
 	now := time.Now()
-	recent := s.failures[ip][:0]
-	for _, t := range s.failures[ip] {
-		if now.Sub(t) < 5*time.Minute {
-			recent = append(recent, t)
+	for key, timestamps := range s.failures {
+		recent := timestamps[:0]
+		for _, t := range timestamps {
+			if now.Sub(t) < 5*time.Minute {
+				recent = append(recent, t)
+			}
+		}
+		if len(recent) == 0 {
+			delete(s.failures, key)
+		} else {
+			s.failures[key] = recent
 		}
 	}
-	s.failures[ip] = recent
-	blocked := len(recent) >= 5
+	blocked := len(s.failures[ip]) >= 5
 	s.mu.Unlock()
 	if blocked {
 		fail(w, 429)
@@ -333,7 +339,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		fail(w, 503)
 		return
 	}
-	write(w, map[string]any{"ok": true, "upstream": s.collector.Snapshot().Status.Connected})
+	write(w, map[string]any{"ok": true, "upstream": s.collector.Status().Connected})
 }
 func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {

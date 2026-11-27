@@ -43,14 +43,11 @@ export default function ConnectionsPage() {
     setRevision(v => v + 1);
     setSelected(null);
   }).catch(() => toast.error('操作失败'));
-  let chains: unknown = null;
-  if (selected && 'chainJson' in selected) {
-    try {
-      chains = JSON.parse(selected.chainJson);
-    } catch {
-      chains = selected.chainJson;
-    }
-  }
+  const detail = selected ? (() => {
+    if ('metadata' in selected) return {host:selected.metadata.host, dst:`${selected.metadata.destinationIP}:${selected.metadata.destinationPort}`, src:`${selected.metadata.sourceIP}:${selected.metadata.sourcePort}`, network:`${selected.metadata.network} / ${selected.metadata.type}`, inbound:selected.metadata.inboundName, chains:selected.chains, up:selected.upload, down:selected.download, start:selected.start ? new Date(selected.start).toLocaleString('zh-CN') : '—', closed:'—', duration:selected.start ? formatDuration(Math.max(0, Date.now() - new Date(selected.start).getTime())) : '—'};
+    let chains: string[] = []; try { const parsed: unknown = JSON.parse(selected.chainJson); if (Array.isArray(parsed)) chains = parsed.map(String); } catch { /* 无法解析代理链 */ }
+    return {host:selected.host, dst:`${selected.dstIp}:${selected.dstPort}`, src:`${selected.srcIp}:${selected.srcPort}`, network:`${selected.network} / ${selected.connType}`, inbound:selected.inboundName, chains, up:selected.uploadBytes, down:selected.downloadBytes, start:formatUnixTime(selected.startAt), closed:formatUnixTime(selected.closedAt), duration:formatDuration(selected.durationMs)};
+  })() : null;
   return <div className="space-y-4">
       <h1 className="text-xl font-semibold">连接审计</h1>
       <Tabs value={tab} onChange={v => {
@@ -144,42 +141,17 @@ export default function ConnectionsPage() {
         <Button disabled={page * 30 >= (history?.total || 0)} onClick={() => setPage(page + 1)}>下一页</Button>
       </div>}
       <Modal open={!!selected} onClose={() => setSelected(null)} title="连接详情">
-        {selected && <div className="space-y-3 text-sm">
-          <Badge>
-  {selected.rule}
-   · 
-  {selected.rulePayload}
-</Badge>
-          {'metadata' in selected ? <>
-            <pre className="overflow-auto whitespace-pre-wrap break-all text-xs">
-              {JSON.stringify({
-              ...selected.metadata,
-              chains: selected.chains,
-              providerChains: selected.providerChains,
-              start: selected.start
-            }, null, 2)}
-            </pre>
-            <Button onClick={() => setConfirm('one')}>断开此连接</Button>
-          </> : <>
-            <div>
-  持续时间：
-  {formatDuration(selected.durationMs)}
-   · 关闭时间：
-  {formatUnixTime(selected.closedAt)}
-</div>
-            <pre className="overflow-auto whitespace-pre-wrap break-all text-xs">
-              {JSON.stringify({
-              ...selected,
-              chainJson: chains
-            }, null, 2)}
-            </pre>
-          </>}
+        {selected && detail && <div className="space-y-4 text-sm">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">{([['目标主机', detail.host], ['目标 IP:端口', detail.dst], ['来源 IP:端口', detail.src], ['网络/协议', detail.network], ['入站', detail.inbound], ['命中规则与载荷', `${selected.rule} · ${selected.rulePayload}`], ['上传/下载流量', `↑ ${formatBytes(detail.up)} · ↓ ${formatBytes(detail.down)}`], ['开始时间', detail.start], ['关闭时间', detail.closed], ['持续时长', detail.duration]]).map(([label,value]) => <div key={label} className="min-w-0"><div className="text-xs text-zinc-500">{label}</div><div className="mt-1 break-all">{value || '—'}</div></div>)}</div>
+          <div><div className="mb-1 text-xs text-zinc-500">完整代理链</div><div className="flex flex-wrap items-center gap-1">{detail.chains.length ? detail.chains.map((chain, i) => <span key={i} className="flex items-center gap-1">{i > 0 && '→'}<Badge>{chain}</Badge></span>) : '—'}</div></div>
+          <details><summary className="cursor-pointer text-zinc-500">原始 JSON</summary><pre className="mt-2 overflow-auto whitespace-pre-wrap break-all text-xs">{JSON.stringify(selected, null, 2)}</pre></details>
+          {'metadata' in selected && <Button onClick={() => setConfirm('one')}>断开此连接</Button>}
         </div>}
       </Modal>
       <ConfirmDialog open={!!confirm} onClose={() => setConfirm('')} title="确认操作" danger onConfirm={() => {
       if (confirm === 'all') run(api.closeConnections);
       if (confirm === 'history') run(api.clearConnections);
-      if (confirm === 'one' && selected) run(() => api.closeConnection(selected.id));
+      if (confirm === 'one' && selected) run(async () => { await api.closeConnection(selected.id); if (paused) setFrozen(items => items.filter(c => c.id !== selected.id)); });
     }}>此操作无法撤销，确定继续吗？</ConfirmDialog>
     </div>;
 }

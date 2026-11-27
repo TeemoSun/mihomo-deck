@@ -70,6 +70,7 @@ type Collector struct {
 	db          *sql.DB
 	client      *mihomo.Client
 	mu          sync.Mutex
+	flushMu     sync.Mutex
 	state       State
 	prefs       database.Preferences
 	active      map[string]Connection
@@ -114,6 +115,11 @@ func (c *Collector) Preferences() database.Preferences {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.prefs
+}
+func (c *Collector) Status() Status {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state.Status
 }
 func (c *Collector) Snapshot() State {
 	c.mu.Lock()
@@ -341,39 +347,52 @@ func (c *Collector) flushLoop(ctx context.Context) {
 	}
 }
 func (c *Collector) flush() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
 	now := time.Now()
-	s := database.TrafficSample{TS: now.Unix(), UpBPS: c.state.Traffic.Up, DownBPS: c.state.Traffic.Down, MemInuse: c.state.Memory.Inuse, MemOslimit: c.state.Memory.Oslimit, ActiveConns: int64(len(c.active))}
-	err := database.RecordTrafficBatch(c.db, []database.TrafficSample{s}, 0, 0, false, now)
-	if err != nil {
-		log.Printf("flush traffic: %v", err)
-	} else {
-		for len(c.totals) > 0 {
-			total := c.totals[0]
-			if err = database.RecordTrafficBatch(c.db, nil, total.UploadTotal, total.DownloadTotal, true, now); err != nil {
-				log.Printf("flush totals: %v", err)
-				break
+	c.mu.Lock()
+	closed, logs, pending := c.closed, c.logs, c.totals
+	c.closed, c.logs, c.totals = nil, nil, nil
+	connected := c.state.Status.Connected
+	sample := database.TrafficSample{TS: now.Unix(), UpBPS: c.state.Traffic.Up, DownBPS: c.state.Traffic.Down, MemInuse: c.state.Memory.Inuse, MemOslimit: c.state.Memory.Oslimit, ActiveConns: int64(len(c.active))}
+	c.mu.Unlock()
+	var samples []database.TrafficSample
+	if connected {
+		samples = append(samples, sample)
+	}
+	totals := make([]database.TrafficTotal, 0, len(pending))
+	for _, total := range pending {
+		totals = append(totals, database.TrafficTotal{Up: total.UploadTotal, Down: total.DownloadTotal})
+	}
+	if len(samples) > 0 || len(totals) > 0 {
+		if err := database.RecordTrafficTotalsBatch(c.db, samples, totals, now); err != nil {
+			log.Printf("flush traffic: %v", err)
+			c.mu.Lock()
+			c.totals = append(pending, c.totals...)
+			c.mu.Unlock()
+		} else if connected {
+			c.mu.Lock()
+			c.state.TrafficHistory = append(c.state.TrafficHistory, sample)
+			if len(c.state.TrafficHistory) > 60 {
+				c.state.TrafficHistory = c.state.TrafficHistory[len(c.state.TrafficHistory)-60:]
 			}
-			c.totals = c.totals[1:]
-		}
-		c.state.TrafficHistory = append(c.state.TrafficHistory, s)
-		if len(c.state.TrafficHistory) > 60 {
-			c.state.TrafficHistory = c.state.TrafficHistory[len(c.state.TrafficHistory)-60:]
+			c.mu.Unlock()
 		}
 	}
-	if len(c.closed) > 0 {
-		if err := database.InsertClosedConnections(c.db, c.closed); err != nil {
+	if len(closed) > 0 {
+		if err := database.InsertClosedConnections(c.db, closed); err != nil {
 			log.Printf("flush connections: %v", err)
-		} else {
-			c.closed = nil
+			c.mu.Lock()
+			c.closed = append(closed, c.closed...)
+			c.mu.Unlock()
 		}
 	}
-	if len(c.logs) > 0 {
-		if err := database.InsertLogs(c.db, c.logs); err != nil {
+	if len(logs) > 0 {
+		if err := database.InsertLogs(c.db, logs); err != nil {
 			log.Printf("flush logs: %v", err)
-		} else {
-			c.logs = nil
+			c.mu.Lock()
+			c.logs = append(logs, c.logs...)
+			c.mu.Unlock()
 		}
 	}
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Area, AreaChart, ResponsiveContainer, Tooltip } from 'recharts';
+import { Area, AreaChart, CartesianGrid, XAxis, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
 import { ChevronDown, ChevronRight, Star } from 'lucide-react';
 import { api } from '../api/client';
 import type { DelayRecord, ProxyItem } from '../types/api';
@@ -16,14 +16,23 @@ export default function ProxiesPage() {
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const [history, setHistory] = useState<DelayRecord[] | null>(null);
   const [historyName, setHistoryName] = useState('');
-  const [busy, setBusy] = useState('');
+  const [busy, setBusy] = useState<string[]>([]);
   const {
     prefs,
     savePrefs
   } = usePrefsStore();
   const toast = useToastStore();
   const load = () => {
-    void api.proxies().then(x => setProxies(x.proxies)).catch(() => toast.error('加载节点失败'));
+    void Promise.all([api.proxies(), api.proxyProviders().catch(() => null)]).then(([proxiesRes, providersRes]) => {
+      const nodes: Record<string, ProxyItem> = {};
+      for (const provider of Object.values(providersRes?.providers || {})) {
+        for (const node of provider.proxies || []) {
+          if (provider.vehicleType === 'Compatible' && nodes[node.name]) continue;
+          nodes[node.name] = { ...node, 'provider-name': node['provider-name'] || provider.name };
+        }
+      }
+      setProxies({ ...nodes, ...proxiesRes.proxies });
+    }).catch(() => toast.error('加载节点失败'));
     void api.configs().then(x => setMode(x.mode)).catch(() => {});
   };
   useEffect(load, []);
@@ -33,15 +42,20 @@ export default function ProxiesPage() {
     pinnedProxies: pinned.includes(name) ? pinned.filter(x => x !== name) : [...pinned, name]
   });
   const action = (key: string, fn: () => Promise<unknown>) => {
-    setBusy(key);
+    setBusy(b => [...b, key]);
     void fn().then(() => {
       toast.success('操作完成');
       load();
-    }).catch(() => toast.error('操作失败')).finally(() => setBusy(''));
+    }).catch(() => toast.error('操作失败')).finally(() => setBusy(b => b.filter(x => x !== key)));
   };
   const allGroups = Object.values(proxies).filter(p => ['Selector', 'URLTest', 'Fallback', 'LoadBalance'].includes(p.type) && p.all);
   const hiddenGroups = prefs?.hiddenGroups || [];
-  const groups = allGroups.filter(g => !hiddenGroups.includes(g.name));
+  const order = proxies.GLOBAL?.all || [];
+  const groups = allGroups.filter(g => !hiddenGroups.includes(g.name)).sort((a, b) => {
+    if (a.name === 'GLOBAL') return mode.toLowerCase() === 'global' ? -1 : 1;
+    if (b.name === 'GLOBAL') return mode.toLowerCase() === 'global' ? 1 : -1;
+    return Number(b.type === 'Selector') - Number(a.type === 'Selector') || (order.indexOf(a.name) < 0 ? Infinity : order.indexOf(a.name)) - (order.indexOf(b.name) < 0 ? Infinity : order.indexOf(b.name));
+  });
   const hiddenCount = groups.reduce((n, g) => n + (g.all || []).filter(x => isInfoPseudoNode(x, prefs?.infoNodePattern || '')).length, 0);
   function node(name: string, group?: ProxyItem) {
     const p = proxies[name] || {
@@ -56,7 +70,7 @@ export default function ProxiesPage() {
         </span>
         <span className="text-xs text-zinc-400">
           {p.type}
-          {p.udp ? '· UDP' : ''}
+          {p.udp ? ' · UDP' : ''}{p.now ? ` · 当前 ${p.now}` : ''}
         </span>
       </button>
       <button aria-label={pinned.includes(name) ? '取消收藏' : '收藏节点'} onClick={() => pin(name)} className={pinned.includes(name) ? 'text-amber-500' : 'text-zinc-300'}>
@@ -68,7 +82,7 @@ export default function ProxiesPage() {
       }}>
         {delay ? `${delay} ms` : '—'}
       </button>
-      <Button disabled={!!busy} onClick={() => action(name, () => api.testProxy(name))}>测速</Button>
+      <Button disabled={busy.includes(`test:${name}`)} onClick={() => action(`test:${name}`, () => api.testProxy(name, p['provider-name']))}>{busy.includes(`test:${name}`) ? '测速中…' : '测速'}</Button>
     </div>;
   }
   return <div className="space-y-5">
@@ -108,7 +122,7 @@ export default function ProxiesPage() {
           return <div key={n}>
             {node(n, matches.length === 1 ? matches[0] : undefined)}
             {matches.length > 1 && <div className="mt-1 flex flex-wrap gap-1">
-              {matches.map(g => <Button key={g.name} className={g.now === n ? '!border-indigo-400 !text-indigo-600' : ''} disabled={!!busy} onClick={() => action(n, () => api.selectProxy(g.name, n))}>
+              {matches.map(g => <Button key={g.name} className={g.now === n ? '!border-indigo-400 !text-indigo-600' : ''} disabled={busy.includes(n)} onClick={() => action(n, () => api.selectProxy(g.name, n))}>
                 {g.name}
                 {g.now === n ? ' ✓' : ''}
               </Button>)}
@@ -133,8 +147,8 @@ export default function ProxiesPage() {
             </Badge>
           </button>
           <span className="text-xs text-zinc-500">当前：{g.now || '—'}</span>
-          <Button disabled={!!busy} onClick={() => action(g.name, () => api.testGroup(g.name))}>测速</Button>
-          {g.fixed && <Button disabled={!!busy} onClick={() => action(g.name, () => api.unfixProxy(g.name))}>取消固定</Button>}
+          <Button disabled={busy.includes(`group:${g.name}`)} onClick={() => action(`group:${g.name}`, () => api.testGroup(g.name))}>{busy.includes(`group:${g.name}`) ? '测速中…' : '测速'}</Button>
+          {g.fixed && <Button disabled={busy.includes(g.name)} onClick={() => action(g.name, () => api.unfixProxy(g.name))}>取消固定</Button>}
           <Button onClick={() => save({
             hiddenGroups: [...hiddenGroups, g.name]
           })}>隐藏</Button>
@@ -149,11 +163,15 @@ export default function ProxiesPage() {
         <div className="h-52">
           {history?.length ? <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={[...history].reverse()}>
-              <Tooltip labelFormatter={(_, payload) => payload?.[0]?.payload ? formatUnixTime(payload[0].payload.testedAt) : ''} formatter={v => `${v} ms`} />
+              <CartesianGrid strokeDasharray="3 3" strokeOpacity={0.12} />
+              <XAxis dataKey="testedAt" tickFormatter={v => new Date(v * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'})} tick={{fontSize:10}} />
+              <YAxis unit=" ms" tick={{fontSize:10}} width={65} />
+              <Tooltip labelFormatter={v => formatUnixTime(Number(v))} formatter={(v, _name, item) => [item.payload.ok ? `${v} ms` : '超时/失败', '延迟']} />
               <Area type="monotone" dataKey="delayMs" name="延迟" stroke="#6366f1" fill="#6366f1" fillOpacity={0.15} />
             </AreaChart>
           </ResponsiveContainer> : <EmptyState>暂无测速记录</EmptyState>}
         </div>
+        {!!history?.length && <div className="mt-3 max-h-48 space-y-1 overflow-auto text-xs">{history.slice(0, 10).map(r => <div key={r.id} className="flex justify-between border-b border-zinc-100 py-1.5 dark:border-zinc-800"><span className="text-zinc-500">{formatUnixTime(r.testedAt)}</span><span className={r.ok ? 'text-emerald-600' : 'text-red-500'}>{r.ok ? `${r.delayMs} ms` : '超时/失败'}</span></div>)}</div>}
       </Modal>
     </div>;
 }

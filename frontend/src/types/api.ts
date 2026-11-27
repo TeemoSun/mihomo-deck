@@ -15,7 +15,7 @@ export interface DBStats { fileSizeBytes:number; trafficSamples:number; trafficH
 export interface CollectorStatus { connected:boolean; lastErr:string; version:string; lastSeenAt:number }
 export interface ActiveConnection { id:string; metadata:{ host:string; destinationIP:string; sniffHost:string; destinationPort:string; sourceIP:string; sourcePort:string; network:string; type:string; inboundName:string }; upload:number; download:number; start:string; chains:string[]; providerChains:string[]; rule:string; rulePayload:string }
 export interface ConnectionsSnapshot { downloadTotal:number; uploadTotal:number; connections:ActiveConnection[]|null }
-export interface ProxyItem { name:string; type:string; udp?:boolean; alive?:boolean; history?:{time:string; delay:number}[]; all?:string[]; now?:string; fixed?:string|boolean }
+export interface ProxyItem { name:string; type:string; udp?:boolean; alive?:boolean; history?:{time:string; delay:number}[]; all?:string[]; now?:string; fixed?:string|boolean; 'provider-name'?:string }
 export interface ProxyProvider { name:string; type:string; vehicleType?:string; updatedAt?:string; proxies:ProxyItem[]; subscriptionInfo?:{Upload:number; Download:number; Total:number; Expire:number} }
 export interface RuleProvider { name:string; type:string; behavior:string; ruleCount:number; updatedAt:string; vehicleType:string }
 export interface RuleItem { type:string; payload:string; proxy:string; size?:number; extra?: { disabled?: boolean; hitCount?: number; hitAt?: string; missCount?: number; missAt?: string } }

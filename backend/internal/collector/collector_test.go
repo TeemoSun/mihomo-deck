@@ -82,10 +82,10 @@ func TestSchedulerCapturePersistsProviderAndScheduledDelay(t *testing.T) {
 		case "/version":
 			_, _ = w.Write([]byte(`{"version":"test-version"}`))
 		case "/providers/proxies":
-			_, _ = w.Write([]byte(`{"providers":{"provider-a":{"subscriptionInfo":{"Upload":11,"Download":22,"Total":33,"Expire":44},"proxies":[{"alive":true},{"alive":false}]}}}`))
+			_, _ = w.Write([]byte(`{"providers":{"default":{"vehicleType":"Compatible","proxies":[{"name":"node-a"}]},"provider-a":{"vehicleType":"HTTP","subscriptionInfo":{"Upload":11,"Download":22,"Total":33,"Expire":44},"proxies":[{"name":"node-a","provider-name":"actual-sub","alive":true},{"alive":false}]}}}`))
 		case "/proxies":
 			_, _ = w.Write([]byte(`{"proxies":{"group-a":{"type":"Selector","now":"node-a"}}}`))
-		case "/proxies/node-a/delay":
+		case "/providers/proxies/actual-sub/node-a/healthcheck":
 			_, _ = w.Write([]byte(`{"delay":123}`))
 		default:
 			http.NotFound(w, r)
@@ -102,12 +102,23 @@ func TestSchedulerCapturePersistsProviderAndScheduledDelay(t *testing.T) {
 	}
 	client := mihomo.NewClient(up.URL, "")
 	c := New(db, client, database.DefaultPreferences(30, 30, "info"))
+	events, unsubscribe := c.Subscribe()
+	defer unsubscribe()
 	c.capture(context.Background())
-	providers, err := database.QueryProviderSnapshots(db, "provider-a", time.Unix(0, 0), 10)
+	select {
+	case event := <-events:
+		status, ok := event.Data.(Status)
+		if event.Type != "status" || !ok || status.Version != "test-version" {
+			t.Fatalf("event: %+v", event)
+		}
+	default:
+		t.Fatal("missing status event")
+	}
+	providers, err := database.QueryProviderSnapshots(db, "", time.Unix(0, 0), 10)
 	if err != nil || len(providers) != 1 {
 		t.Fatalf("providers %+v %v", providers, err)
 	}
-	if providers[0].UploadBytes != 11 || providers[0].AliveCount != 1 || providers[0].NodeCount != 2 {
+	if providers[0].ProviderName != "provider-a" || providers[0].UploadBytes != 11 || providers[0].AliveCount != 1 || providers[0].NodeCount != 2 {
 		t.Fatalf("provider snapshot %+v", providers[0])
 	}
 	delays, err := database.QueryDelays(db, "node-a", time.Unix(0, 0), 10)
@@ -156,5 +167,44 @@ func TestPruneTelemetryKeepsRecentRecords(t *testing.T) {
 		if n != 1 {
 			t.Errorf("%s kept %d rows", table, n)
 		}
+	}
+}
+
+func TestFlushDisconnectedAndRetry(t *testing.T) {
+	db, err := database.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	c := New(db, nil, database.DefaultPreferences(30, 30, "info"))
+	c.totals = []ConnectionsSnapshot{{UploadTotal: 12}}
+	c.logs = []database.LogEntry{{TS: time.Now().Unix(), Level: "error", Payload: "retry"}}
+	c.closed = []database.ClosedConnection{{ID: "retry"}}
+	if _, err = db.Exec(`CREATE TRIGGER reject_total BEFORE INSERT ON traffic_cursor BEGIN SELECT RAISE(ABORT, 'rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	c.flush()
+	if len(c.totals) != 1 || len(c.Snapshot().TrafficHistory) != 0 {
+		t.Fatal("failed totals not retained or disconnected history recorded")
+	}
+	if _, err = db.Exec("DROP TRIGGER reject_total"); err != nil {
+		t.Fatal(err)
+	}
+	c.flush()
+	summary, err := database.GetTrafficSummary(db, time.Now())
+	if err != nil || summary.CumulativeUp != 12 || len(c.totals) != 0 {
+		t.Fatalf("summary %+v: %v", summary, err)
+	}
+	var n int
+	if err = db.QueryRow("SELECT count(*) FROM traffic_samples").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("disconnected samples %d: %v", n, err)
+	}
+	c.setStatus("traffic", true, nil)
+	c.flush()
+	if len(c.Snapshot().TrafficHistory) != 1 {
+		t.Fatal("connected sample missing")
 	}
 }

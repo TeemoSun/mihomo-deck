@@ -196,8 +196,8 @@ func QueryConnections(db *sql.DB, f ConnectionFilter) (p PagedConnections, err e
 	w := []string{"1=1"}
 	args := []any{}
 	if f.Q != "" {
-		w = append(w, "(host LIKE ? OR dst_ip LIKE ? OR src_ip LIKE ? OR primary_proxy LIKE ? OR rule_payload LIKE ?)")
-		for i := 0; i < 5; i++ {
+		w = append(w, "(host LIKE ? OR dst_ip LIKE ? OR src_ip LIKE ? OR primary_proxy LIKE ? OR rule_payload LIKE ? OR rule LIKE ?)")
+		for i := 0; i < 6; i++ {
 			args = append(args, "%"+f.Q+"%")
 		}
 	}

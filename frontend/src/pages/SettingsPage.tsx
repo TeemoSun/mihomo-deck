@@ -20,6 +20,8 @@ export default function SettingsPage() {
   const [current, setCurrent] = useState('');
   const [password, setPassword] = useState('');
   const [repeat, setRepeat] = useState('');
+  const [draft, setDraft] = useState({delayTestUrl:'', delayTestTimeout:'', retentionDays:'', snapshotIntervalMin:'', infoNodePattern:''});
+  const [savingDraft, setSavingDraft] = useState(false);
   const {
     prefs,
     savePrefs
@@ -29,6 +31,15 @@ export default function SettingsPage() {
     updatePassword,
     logout
   } = useAuthStore();
+  useEffect(() => { if (prefs) setDraft({delayTestUrl:prefs.delayTestUrl, delayTestTimeout:String(prefs.delayTestTimeout), retentionDays:String(prefs.retentionDays), snapshotIntervalMin:String(prefs.snapshotIntervalMin), infoNodePattern:prefs.infoNodePattern}); }, [prefs?.delayTestUrl, prefs?.delayTestTimeout, prefs?.retentionDays, prefs?.snapshotIntervalMin, prefs?.infoNodePattern]);
+  const dirty = !!prefs && (draft.delayTestUrl !== prefs.delayTestUrl || draft.delayTestTimeout !== String(prefs.delayTestTimeout) || draft.retentionDays !== String(prefs.retentionDays) || draft.snapshotIntervalMin !== String(prefs.snapshotIntervalMin) || draft.infoNodePattern !== prefs.infoNodePattern);
+  const saveDraft = () => {
+    const values = [draft.delayTestTimeout, draft.retentionDays, draft.snapshotIntervalMin].map(value => value.trim());
+    const nums = values.map(Number);
+    try { const url = new URL(draft.delayTestUrl); if (!['http:', 'https:'].includes(url.protocol)) throw new Error(); new RegExp(draft.infoNodePattern); } catch { toast.error('请输入有效的测速 URL 和匹配表达式'); return; }
+    if (values.some(value => !/^\d+$/.test(value)) || nums.some(n => !Number.isInteger(n)) || nums[0] < 100 || nums[0] > 60000 || nums[1] < 1 || nums[1] > 3650 || nums[2] < 0 || nums[2] > 10080) { toast.error('测速超时须为 100–60000，保留天数 1–3650，快照间隔 0–10080'); return; }
+    setSavingDraft(true); void savePrefs({...draft, delayTestTimeout:nums[0], retentionDays:nums[1], snapshotIntervalMin:nums[2]}).then(() => toast.success('参数已保存')).catch(() => toast.error('保存参数失败')).finally(() => setSavingDraft(false));
+  };
   const status = useLiveStore(s => s.status);
   const toast = useToastStore();
   const load = () => {
@@ -57,9 +68,9 @@ export default function SettingsPage() {
   const patch = () => {
     if (!config || !original) return;
     const changed = Object.fromEntries(Object.entries(config).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(original[key])));
-    if (Object.keys(changed).length) action(() => api.patchConfig(changed));
+    if (Object.keys(changed).length) action(async () => { await api.patchConfig(changed); window.dispatchEvent(new Event('deck-mode')); });
   };
-  const critical = () => !!config && !!original && (original['allow-lan'] === true && config['allow-lan'] === false || config.mode === 'direct' && original.mode !== 'direct' || ['mixed-port', 'port', 'socks-port', 'redir-port', 'tproxy-port'].some(k => config[k] !== original[k]) || tun.enable !== oldTun.enable);
+  const critical = () => !!config && !!original && (original['allow-lan'] === true && config['allow-lan'] === false || String(config.mode ?? '').toLowerCase() === 'direct' && String(original.mode ?? '').toLowerCase() !== 'direct' || ['mixed-port', 'port', 'socks-port', 'redir-port', 'tproxy-port'].some(k => config[k] !== original[k]) || tun.enable !== oldTun.enable);
   return <div className="space-y-5">
       <h1 className="text-xl font-semibold">设置</h1>
       <Card className="space-y-4 p-4">
@@ -70,7 +81,7 @@ export default function SettingsPage() {
               <span>
                 {label}
               </span>
-              {options ? <Select className="w-full" value={String(config[key] ?? '')} onChange={e => change(key, e.target.value)}>
+              {options ? <Select className="w-full" value={['mode', 'log-level'].includes(key) ? String(config[key] ?? '').toLowerCase() : String(config[key] ?? '')} onChange={e => change(key, e.target.value)}>
                 {options.map(v => <option key={v}>
                   {v}
                 </option>)}
@@ -137,13 +148,11 @@ export default function SettingsPage() {
                 </option>)}
               </Select>
             </label>)}
-            {([['delayTestUrl', '测速 URL', false], ['delayTestTimeout', '测速超时（毫秒）', true], ['retentionDays', '保留天数', true], ['snapshotIntervalMin', '快照间隔（分钟）', true]] as [keyof Preferences, string, boolean][]).map(([key, label, numeric]) => <label key={key} className="space-y-1 text-sm">
+            {([['delayTestUrl', '测速 URL', false], ['delayTestTimeout', '测速超时（毫秒）', true], ['retentionDays', '保留天数', true], ['snapshotIntervalMin', '快照间隔（分钟）', true]] as [keyof typeof draft, string, boolean][]).map(([key, label, numeric]) => <label key={key} className="space-y-1 text-sm">
               <span>
                 {label}
               </span>
-              <Input className="w-full" type={numeric ? 'number' : 'text'} defaultValue={String(prefs[key])} key={`${key}-${prefs[key]}`} onBlur={e => save({
-              [key]: numeric ? Number(e.target.value) : e.target.value
-            })} />
+              <Input className="w-full" type={numeric ? 'number' : 'text'} value={draft[key]} onChange={e => setDraft(d => ({...d, [key]: e.target.value}))} />
             </label>)}
           </div>
           <div className="flex flex-wrap gap-4">
@@ -155,12 +164,9 @@ export default function SettingsPage() {
           })} />
           </div>
           <div className="flex flex-wrap gap-2">
-            <Input className="min-w-48 flex-1" aria-label="信息节点匹配表达式" defaultValue={prefs.infoNodePattern} key={prefs.infoNodePattern} onBlur={e => save({
-            infoNodePattern: e.target.value
-          })} />
-            <Button onClick={() => save({
-            infoNodePattern: '剩余流量|距离下次|套餐到期|官网|重置|到期|Traffic|Expire|Website'
-          })}>恢复默认表达式</Button>
+            <Input className="min-w-48 flex-1" aria-label="信息节点匹配表达式" value={draft.infoNodePattern} onChange={e => setDraft(d => ({...d, infoNodePattern:e.target.value}))} />
+            <Button onClick={() => setDraft(d => ({...d, infoNodePattern: '剩余流量|距离下次|套餐到期|官网|重置|到期|Traffic|Expire|Website'}))}>恢复默认表达式</Button>
+            <Button disabled={!dirty || savingDraft} onClick={saveDraft}>{savingDraft ? '保存中…' : '保存参数'}</Button>
           </div>
         </>}
         {stats && <div className="text-sm text-zinc-500">
@@ -218,7 +224,7 @@ export default function SettingsPage() {
       <ConfirmDialog open={!!confirm} onClose={() => setConfirm('')} title="确认操作" danger onConfirm={() => {
       if (confirm === 'config') patch();
       if (confirm === 'reload') action(() => api.reloadConfig());
-      if (confirm === 'restart') action(api.restart);
+      if (confirm === 'restart') action(async () => { await api.restart(); await new Promise(resolve => setTimeout(resolve, 1500)); });
       if (confirm === 'connections') action(api.clearConnections);
       if (confirm === 'logs') action(api.clearLogs);
     }}>此操作可能影响连接或删除历史数据，确定继续吗？</ConfirmDialog>
