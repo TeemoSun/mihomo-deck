@@ -1,0 +1,43 @@
+services:
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: mihomo
+    restart: unless-stopped
+    ports:
+      - "7890:7890"
+      - "9090:9090"
+    volumes:
+      - ./data:/root/.config/mihomo
+
+  mihomo-deck:
+    image: ghcr.io/teemosun/mihomo-deck:latest
+    container_name: mihomo-deck
+    restart: unless-stopped
+    ports:
+      - "${DECK_PORT:-18080}:8080"
+    volumes:
+      - ./deck-data:/data
+    depends_on:
+      - mihomo
+    healthcheck:
+      test: ["CMD", "/app/mihomo-deck", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      PORT: "8080"
+      DB_PATH: /data/mihomo-deck.db
+      STATIC_DIR: /app/static
+      # Use http://mihomo:9090 if the host firewall blocks bridge-to-host LAN IP access.
+      MIHOMO_URL: http://192.168.5.2:9090
+      MIHOMO_SECRET: ${MIHOMO_SECRET:-}
+      AUTH_USERNAME: ${AUTH_USERNAME:-admin}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:?请先在 .env 中设置 AUTH_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?请先在 .env 中设置 JWT_SECRET}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      SNAPSHOT_INTERVAL_MIN: ${SNAPSHOT_INTERVAL_MIN:-30}
+      LOG_PERSIST_LEVEL: ${LOG_PERSIST_LEVEL:-info}
+      TZ: ${TZ:-Asia/Shanghai}

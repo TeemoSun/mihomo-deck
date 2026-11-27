@@ -1,0 +1,8 @@
+.git
+.env
+data
+deck-data
+frontend/node_modules
+frontend/dist
+backend/mihomo-deck
+docs

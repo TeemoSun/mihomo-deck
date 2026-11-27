@@ -1,0 +1,11 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+data/
+deck-data/
+frontend/dist/
+frontend/node_modules/
+backend/mihomo-deck
+.tmp/
+*.log
