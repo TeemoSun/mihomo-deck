@@ -74,7 +74,7 @@ export default function OverviewPage() {
           { label: '今日流量', value: formatBytes((sum?.todayUp || 0) + (sum?.todayDown || 0)), detail: `↑ ${formatBytes(sum?.todayUp || 0)} · ↓ ${formatBytes(sum?.todayDown || 0)}` },
           { label: '近 7 天流量', value: formatBytes((sum?.weekUp || 0) + (sum?.weekDown || 0)) },
           { label: '近 30 天流量', value: formatBytes((sum?.monthUp || 0) + (sum?.monthDown || 0)) },
-          { label: '跨重启累计流量', value: formatBytes((sum?.cumulativeUp || 0) + (sum?.cumulativeDown || 0)), detail: `↑ ${formatBytes(sum?.cumulativeUp || 0)} · ↓ ${formatBytes(sum?.cumulativeDown || 0)}` }
+          { label: '累计流量', value: formatBytes((sum?.cumulativeUp || 0) + (sum?.cumulativeDown || 0)), detail: `↑ ${formatBytes(sum?.cumulativeUp || 0)} · ↓ ${formatBytes(sum?.cumulativeDown || 0)}` }
         ].map(({label, value, detail}) => <Card key={label} className="p-4"><div className="text-xs text-zinc-500">{label}</div><div className="mt-2 text-lg font-semibold">{value}</div>{detail && <div className="mt-1 text-xs text-zinc-500">{detail}</div>}</Card>)}
       </div>
       <Card className="p-4">
