@@ -96,12 +96,15 @@ func ValidPassword(password string) bool {
 	return ValidPasswordLength(password) && !weak(password)
 }
 
-func (c Config) ValidateSecrets(passwordNeeded bool) error {
-	if passwordNeeded && !ValidPassword(c.AuthPassword) {
+func (c Config) ValidateSecrets() error {
+	if strings.TrimSpace(c.AuthUsername) == "" {
+		return fmt.Errorf("AUTH_USERNAME must not be empty")
+	}
+	if !ValidPassword(c.AuthPassword) {
 		return fmt.Errorf("AUTH_PASSWORD must be 8 to 72 bytes and not a weak placeholder")
 	}
 	if weak(c.JWTSecret) || len(c.JWTSecret) < 16 {
-		return fmt.Errorf("JWT_SECRET must be at least 16 characters and not a placeholder")
+		return fmt.Errorf("JWT_SECRET must be at least 16 bytes and not a placeholder")
 	}
 	return nil
 }

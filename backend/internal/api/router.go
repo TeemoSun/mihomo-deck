@@ -54,7 +54,6 @@ func NewRouter(db *sql.DB, cfg config.Config, client *mihomo.Client, c *collecto
 		r.Use(s.requireAuth)
 		r.Use(s.requireCSRF)
 		r.Get("/api/auth/me", s.me)
-		r.With(requireJSON).Post("/api/auth/password", s.password)
 		r.Get("/api/preferences", s.getPreferences)
 		r.Put("/api/preferences", s.putPreferences)
 		r.Get("/api/overview", s.overview)

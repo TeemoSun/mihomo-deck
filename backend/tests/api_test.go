@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net"
@@ -20,7 +21,6 @@ import (
 	"github.com/TeemoSun/mihomo-deck/internal/database"
 	"github.com/TeemoSun/mihomo-deck/internal/mihomo"
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/bcrypt"
 )
 
 func TestAuthAndProxy(t *testing.T) {
@@ -41,7 +41,7 @@ func TestAuthAndProxy(t *testing.T) {
 	if err = database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	if err = database.EnsureAdminSeed(db, "admin", "good-password"); err != nil {
+	if err = database.SyncAdmin(db, "admin", "good-password"); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Config{JWTSecret: "a-strong-test-secret", DBPath: ":memory:"}
@@ -112,19 +112,41 @@ func TestAuthAndProxy(t *testing.T) {
 }
 
 func TestValidateSecrets(t *testing.T) {
-	for _, password := range []string{"", "admin", "password", "secret", "changeme", "change-me", "123456"} {
-		if err := (config.Config{AuthPassword: password, JWTSecret: "a-strong-test-secret"}).ValidateSecrets(true); err == nil {
-			t.Errorf("ValidateSecrets accepted password %q", password)
+	valid := config.Config{AuthUsername: "admin", AuthPassword: "good-password", JWTSecret: testJWTSecret}
+	for _, username := range []string{"", " \t\n"} {
+		cfg := valid
+		cfg.AuthUsername = username
+		if err := cfg.ValidateSecrets(); err == nil || !strings.Contains(err.Error(), "AUTH_USERNAME") {
+			t.Errorf("ValidateSecrets returned %v for username %q", err, username)
 		}
 	}
-	for _, secret := range []string{"", "admin", "password", "secret", "changeme", "change-me", "123456"} {
-		if err := (config.Config{AuthPassword: "good-password", JWTSecret: secret}).ValidateSecrets(true); err == nil {
-			t.Errorf("ValidateSecrets accepted JWT secret %q", secret)
+	for _, password := range []string{"", "admin", "password", "secret", "changeme", "change-me", "123456", "Short7!", strings.Repeat("界", 24) + "a"} {
+		cfg := valid
+		cfg.AuthPassword = password
+		if err := cfg.ValidateSecrets(); err == nil || !strings.Contains(err.Error(), "AUTH_PASSWORD") {
+			t.Errorf("ValidateSecrets returned %v for password %q", err, password)
+		}
+	}
+	for _, secret := range []string{"", "admin", "password", "secret", "changeme", "change-me", "123456", "    ChAnGeMe    ", "123456789012345"} {
+		cfg := valid
+		cfg.JWTSecret = secret
+		if err := cfg.ValidateSecrets(); err == nil || !strings.Contains(err.Error(), "JWT_SECRET") {
+			t.Errorf("ValidateSecrets returned %v for JWT secret %q", err, secret)
 		}
 	}
 	for _, secret := range []string{"", "x"} {
-		if err := (config.Config{AuthPassword: "good-password", JWTSecret: "a-strong-test-secret", MihomoSecret: secret}).ValidateSecrets(true); err != nil {
+		cfg := valid
+		cfg.MihomoSecret = secret
+		if err := cfg.ValidateSecrets(); err != nil {
 			t.Errorf("ValidateSecrets rejected Mihomo secret %q: %v", secret, err)
+		}
+	}
+	for _, password := range []string{"界界ab", strings.Repeat("界", 24)} {
+		cfg := valid
+		cfg.AuthPassword = password
+		cfg.JWTSecret = strings.Repeat("界", 5) + "a"
+		if err := cfg.ValidateSecrets(); err != nil {
+			t.Errorf("ValidateSecrets rejected a password of %d bytes and a JWT secret of %d bytes: %v", len(password), len(cfg.JWTSecret), err)
 		}
 	}
 }
@@ -140,7 +162,7 @@ func TestLoginRateLimitAndTrustedProxyIP(t *testing.T) {
 	if err = database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	if err = database.EnsureAdminSeed(db, "admin", "good-password"); err != nil {
+	if err = database.SyncAdmin(db, "admin", "good-password"); err != nil {
 		t.Fatal(err)
 	}
 	client := mihomo.NewClient(upstream.URL, "")
@@ -167,102 +189,73 @@ func TestLoginRateLimitAndTrustedProxyIP(t *testing.T) {
 	}
 }
 
-func TestPasswordChangePersistsAndRotatesSessions(t *testing.T) {
+func TestEnvCredentialsSyncAcrossRestartAndRevokeOldSessions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.db")
-	db, err := database.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = database.Migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	if err = database.EnsureAdminSeed(db, "admin", "good-password"); err != nil {
-		t.Fatal(err)
-	}
-	upstream := httptest.NewServer(http.NotFoundHandler())
-	defer upstream.Close()
-	client := mihomo.NewClient(upstream.URL, "")
-	c := collector.New(db, client, database.DefaultPreferences(30, 30, "info"))
-	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, c)
-	loginReq := func(password string) *httptest.ResponseRecorder {
-		req := jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"`+password+`"}`))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		return rec
-	}
-	login := loginReq("good-password")
-	if login.Code != 200 {
-		t.Fatalf("login %d", login.Code)
-	}
-	var payload struct {
-		CSRF string `json:"csrfToken"`
-	}
-	_ = json.Unmarshal(login.Body.Bytes(), &payload)
-	oldCookies := login.Result().Cookies()
-	change := jsonRequest("POST", "/api/auth/password", strings.NewReader(`{"currentPassword":"good-password","newPassword":"new-good-password"}`))
-	for _, cookie := range oldCookies {
-		change.AddCookie(cookie)
-	}
-	change.Header.Set("X-CSRF-Token", payload.CSRF)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, change)
-	if rec.Code != 200 {
-		t.Fatalf("change %d %s", rec.Code, rec.Body.String())
-	}
-	newCookies := rec.Result().Cookies()
-	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
-	requestWith := func(path string, cookies []*http.Cookie, csrf string) int {
-		r := httptest.NewRequest("GET", path, nil)
-		for _, cookie := range cookies {
-			r.AddCookie(cookie)
+	const username, oldPassword, newPassword = "admin", "good-password", "new-good-password"
+	var db *sql.DB
+	t.Cleanup(func() {
+		if db != nil {
+			db.Close()
 		}
-		r.Header.Set("X-CSRF-Token", csrf)
-		out := httptest.NewRecorder()
-		h.ServeHTTP(out, r)
-		return out.Code
+	})
+	restart := func(password string) *api.Server {
+		t.Helper()
+		if db != nil {
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cfg := config.Config{AuthUsername: username, AuthPassword: password, JWTSecret: testJWTSecret}
+		if err := cfg.ValidateSecrets(); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		db, err = database.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Migrate(db); err != nil {
+			t.Fatal(err)
+		}
+		if err := database.SyncAdmin(db, cfg.AuthUsername, cfg.AuthPassword); err != nil {
+			t.Fatal(err)
+		}
+		c := collector.New(db, nil, database.DefaultPreferences(30, 30, "info"))
+		return api.NewRouter(db, cfg, nil, c)
 	}
-	if got := requestWith("/api/auth/me", oldCookies, payload.CSRF); got != 401 {
-		t.Fatalf("old access cookie status %d", got)
+
+	deck := restart(oldPassword)
+	login := loginToDeck(deck, username, oldPassword)
+	loginCSRF(t, login)
+
+	deck = restart(oldPassword)
+	me := httptest.NewRequest("GET", "/api/auth/me", nil)
+	if rec := serveDeck(deck, withSession(me, login, "")); rec.Code != http.StatusOK {
+		t.Fatalf("access after restart with unchanged credentials: %d", rec.Code)
 	}
 	refresh := httptest.NewRequest("POST", "/api/auth/refresh", nil)
-	for _, cookie := range oldCookies {
-		if cookie.Name == "deck_refresh" {
-			refresh.AddCookie(cookie)
-		}
+	rotated := serveDeck(deck, withSession(refresh, login, ""))
+	if rotated.Code != http.StatusOK {
+		t.Fatalf("refresh after restart with unchanged credentials: %d", rotated.Code)
 	}
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, refresh)
-	if rr.Code != 401 {
-		t.Fatalf("old refresh cookie status %d", rr.Code)
+
+	deck = restart(newPassword)
+	me = httptest.NewRequest("GET", "/api/auth/me", nil)
+	if rec := serveDeck(deck, withSession(me, rotated, "")); rec.Code != http.StatusUnauthorized {
+		t.Errorf("old access after credential change: %d", rec.Code)
 	}
-	if got := requestWith("/api/auth/me", newCookies, payload.CSRF); got != 200 {
-		t.Fatalf("new session status %d", got)
+	refresh = httptest.NewRequest("POST", "/api/auth/refresh", nil)
+	if rec := serveDeck(deck, withSession(refresh, rotated, "")); rec.Code != http.StatusUnauthorized {
+		t.Errorf("old refresh after credential change: %d", rec.Code)
 	}
-	db.Close()
-	db, err = database.Open(path)
-	if err != nil {
-		t.Fatal(err)
+	if rec := loginToDeck(deck, username, oldPassword); rec.Code != http.StatusUnauthorized {
+		t.Errorf("login with old password: %d", rec.Code)
 	}
-	defer db.Close()
-	if err = database.Migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	if err = database.EnsureAdminSeed(db, "admin", "some-other-seed"); err != nil {
-		t.Fatal(err)
-	}
-	u, err := database.GetUserByUsername(db, "admin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte("new-good-password")); err != nil {
-		t.Fatalf("password did not persist: %v", err)
-	}
-	newClient := mihomo.NewClient(upstream.URL, "")
-	newHandler := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, newClient, collector.New(db, newClient, database.DefaultPreferences(30, 30, "info")))
-	after := httptest.NewRecorder()
-	newHandler.ServeHTTP(after, jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"new-good-password"}`)))
-	if after.Code != 200 {
-		t.Fatalf("new password did not authenticate after reopening database: %d", after.Code)
+	login = loginToDeck(deck, username, newPassword)
+	csrf := loginCSRF(t, login)
+	removed := jsonRequest("POST", "/api/auth/password", strings.NewReader(`{"currentPassword":"new-good-password","newPassword":"another-password"}`))
+	if rec := serveDeck(deck, withSession(removed, login, csrf)); rec.Code != http.StatusNotFound {
+		t.Errorf("removed password route: %d", rec.Code)
 	}
 }
 
@@ -275,7 +268,9 @@ func TestPreferencesPersistenceAndBounds(t *testing.T) {
 	if err = database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	_ = database.EnsureAdminSeed(db, "admin", "good-password")
+	if err := database.SyncAdmin(db, "admin", "good-password"); err != nil {
+		t.Fatal(err)
+	}
 	up := httptest.NewServer(http.NotFoundHandler())
 	defer up.Close()
 	client := mihomo.NewClient(up.URL, "")
@@ -333,7 +328,9 @@ func TestOverviewUpstreamTimeoutFallback(t *testing.T) {
 	if err = database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	_ = database.EnsureAdminSeed(db, "admin", "good-password")
+	if err := database.SyncAdmin(db, "admin", "good-password"); err != nil {
+		t.Fatal(err)
+	}
 	client := mihomo.NewClient(up.URL, "")
 	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
 	login := httptest.NewRecorder()
@@ -373,7 +370,9 @@ func TestProxyPreservesUpstream504(t *testing.T) {
 	if err = database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	_ = database.EnsureAdminSeed(db, "admin", "good-password")
+	if err := database.SyncAdmin(db, "admin", "good-password"); err != nil {
+		t.Fatal(err)
+	}
 	client := mihomo.NewClient(up.URL, "")
 	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
 	login := httptest.NewRecorder()
@@ -432,7 +431,7 @@ func TestLiveTrafficStream(t *testing.T) {
 	if err = database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	if err = database.EnsureAdminSeed(db, "admin", "good-password"); err != nil {
+	if err = database.SyncAdmin(db, "admin", "good-password"); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Config{JWTSecret: "a-strong-test-secret", DBPath: ":memory:"}
@@ -528,7 +527,7 @@ func TestProviderProxyDelay(t *testing.T) {
 	if err = database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	if err = database.EnsureAdminSeed(db, "admin", "good-password"); err != nil {
+	if err = database.SyncAdmin(db, "admin", "good-password"); err != nil {
 		t.Fatal(err)
 	}
 	client := mihomo.NewClient(up.URL, "")

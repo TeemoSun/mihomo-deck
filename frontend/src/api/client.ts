@@ -109,8 +109,6 @@ export const api = {
     request<AuthUser>('/api/auth/login', { method: 'POST', body: body({ username, password }) }, false),
   me: () => request<AuthUser>('/api/auth/me'),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }, false),
-  password: (currentPassword: string, newPassword: string) =>
-    request<{ csrfToken: string }>('/api/auth/password', { method: 'POST', body: body({ currentPassword, newPassword }) }),
 
   preferences: () => request<Preferences>('/api/preferences'),
   savePreferences: (prefs: Partial<Preferences>) =>

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func reviewDB(t *testing.T) *sql.DB {
@@ -23,24 +25,54 @@ func reviewDB(t *testing.T) *sql.DB {
 	return db
 }
 
-func TestStalePasswordVersionCannotIssueSession(t *testing.T) {
-	db := reviewDB(t)
-	if err := EnsureAdminSeed(db, "admin", "good-password"); err != nil {
-		t.Fatal(err)
-	}
-	old, err := GetUserByUsername(db, "admin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = UpdatePassword(db, old.ID, old.TokenVersion, "new-password"); err != nil {
-		t.Fatal(err)
-	}
-	token := RefreshToken{UserID: old.ID, ID: "stale", TokenHash: "stale"}
-	if err = CreateRefreshTokenIfVersion(db, token, old.TokenVersion); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("stale refresh insertion returned %v", err)
-	}
-	if err = UpdatePassword(db, old.ID, old.TokenVersion, "other-password"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("stale password update returned %v", err)
+func TestSyncAdminPreservesAndRotatesSessionsOnEnvChange(t *testing.T) {
+	const username, password = "admin", "good-password"
+	for _, next := range []struct {
+		name, username, password string
+		changed                  bool
+	}{
+		{name: "same credentials", username: username, password: password},
+		{name: "changed password", username: username, password: "new-password", changed: true},
+		{name: "changed username", username: "new-admin", password: password, changed: true},
+	} {
+		t.Run(next.name, func(t *testing.T) {
+			db := reviewDB(t)
+			if err := SyncAdmin(db, username, password); err != nil {
+				t.Fatal(err)
+			}
+			before, err := GetUserByUsername(db, username)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now()
+			token := RefreshToken{ID: "refresh", SessionID: "refresh", UserID: before.ID, TokenHash: "hash", ExpiresAt: now.Add(time.Hour).Unix()}
+			if err := CreateRefreshToken(db, token); err != nil {
+				t.Fatal(err)
+			}
+			if err := SyncAdmin(db, next.username, next.password); err != nil {
+				t.Fatal(err)
+			}
+			after, err := GetUserByID(db, before.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, refreshErr := GetRefreshUser(db, token.TokenHash, now)
+			if !next.changed {
+				if after != before || refreshErr != nil {
+					t.Fatalf("unchanged credentials affected the admin or refresh session: %v", refreshErr)
+				}
+				return
+			}
+			if after.Username != next.username || after.TokenVersion != before.TokenVersion+1 || after.PasswordHash == before.PasswordHash {
+				t.Fatalf("credential update returned username %q and token version %d, want %q and %d with a new hash", after.Username, after.TokenVersion, next.username, before.TokenVersion+1)
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(after.PasswordHash), []byte(next.password)); err != nil {
+				t.Fatalf("stored hash does not match configured password: %v", err)
+			}
+			if !errors.Is(refreshErr, sql.ErrNoRows) {
+				t.Fatalf("revoked refresh lookup returned %v", refreshErr)
+			}
+		})
 	}
 }
 

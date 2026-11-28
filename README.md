@@ -19,7 +19,7 @@
 ## ✨ 核心特性
 
 - **🔐 独立登录认证与安全代理**
-  - 单管理员账号密码登录（环境变量初始化引导，网页端改密后写入 SQLite 跨重启持久化）
+  - 单管理员账号密码登录，凭据由 `.env` 配置，每次启动时校验并同步到 SQLite
   - HttpOnly 双 Token Cookie（`deck_access` 15 分钟 + `deck_refresh` 30 天轮换）与派生 `X-CSRF-Token` 校验
   - 登录失败滑动窗口限流（同一 IP 在 5 分钟内累计 5 次失败后，后续尝试返回 `429`）与严格安全响应头（CSP `script-src 'self'`、nosniff、DENY）
   - 服务端环境变量固定上游 `MIHOMO_URL` / `MIHOMO_SECRET`，前端无多后端弹窗，开箱即用
@@ -51,7 +51,7 @@ cp docker-compose.sample.yml docker-compose.yml
 cp .env.example .env
 
 # 2. 编辑 .env，设置 JWT_SECRET（例如执行 openssl rand -hex 32）。
-#    首次初始化时设置 AUTH_PASSWORD（8–72 个 UTF-8 字节，避开弱占位值）。
+#    设置 AUTH_USERNAME 和 AUTH_PASSWORD（密码为 8–72 个 UTF-8 字节，避开弱占位值）。
 #    将 MIHOMO_SECRET 设置为 Mihomo config.yaml 中的 secret。控制端未配置 secret 时留空。
 
 # 3. 启动服务
@@ -64,7 +64,7 @@ docker compose up -d
 
 > **安全说明**
 > - Compose 默认只在项目网络内提供 `9090` 控制端口。启用示例中注释的 `9090:9090` 会允许客户端直连 Mihomo，绕过 Deck 登录。
-> - Go 服务仅在 SQLite 的 `users` 表为空时验证 `AUTH_PASSWORD` 并初始化账号。复用已有账号的数据库重启时，可以省略 `AUTH_PASSWORD`。网页修改后的密码保存在 `./deck-data` 挂载的数据库中。
+> - 管理员凭据仅由 `.env` 中的 `AUTH_USERNAME` 和 `AUTH_PASSWORD` 配置。修改后运行 `docker compose up -d mihomo-deck`，让 Compose 用新环境变量重建容器。Deck 每次启动时校验凭据并自动同步到 SQLite。用户名或密码变更后，旧会话失效，需要重新登录。
 > - 通过 HTTPS 反向代理部署时，设置 `TRUST_PROXY=true`，将 `TRUSTED_PROXIES` 限定为实际反向代理的 IP 网段，并设置 `COOKIE_SECURE=auto` 或 `true`。`auto` 在直接 TLS 连接或可信代理发送 `X-Forwarded-Proto: https` 时启用 `Secure`。
 > - Deck 的节点测速、策略组测速和代理提供者健康检查均使用 `POST`，并校验 `X-CSRF-Token`。Deck 的认证失败以 `401` 和 `X-Deck-Auth-Error: 1` 标识。支持的 Mihomo API 子集见[路由表](./docs/DESIGN.md#mihomo-api-子集)。
 
@@ -80,8 +80,8 @@ docker compose up -d
 | `STATIC_DIR` | 前端静态资源目录，示例 Compose 固定为 `/app/static` | `/app/static` |
 | `MIHOMO_URL` | Mihomo external-controller 的 HTTP(S) 地址，支持路径前缀，禁止内嵌凭据、查询串和片段 | Compose 为 `http://mihomo:9090`，独立运行 Go 服务为 `http://127.0.0.1:9090` |
 | `MIHOMO_SECRET` | Mihomo external-controller 配置的 `secret`，由 Deck 服务端使用 | 空 |
-| `AUTH_USERNAME` | 初始管理员用户名 | `admin` |
-| `AUTH_PASSWORD` | `users` 表为空时必填，须为 8–72 个 UTF-8 字节且避开弱占位值 | 空 |
+| `AUTH_USERNAME` | 管理员用户名，每次启动时校验，须包含非空白字符 | `admin` |
+| `AUTH_PASSWORD` | 管理员密码，每次启动必填，须为 8–72 个 UTF-8 字节且避开弱占位值 | 无可用默认值 |
 | `JWT_SECRET` | JWT 与 CSRF 签名密钥，必填，至少 16 字节且避开弱占位值 | 无可用默认值 |
 | `TRUST_PROXY` | 是否接受可信代理的 `X-Forwarded-For`、`X-Real-IP` 和 `X-Forwarded-Proto` | `false` |
 | `TRUSTED_PROXIES` | `TRUST_PROXY=true` 时使用的逗号分隔 CIDR 列表 | 默认列表为 `127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`。Compose 在变量未设置或为空时使用此列表。独立运行 Go 服务且未设置本变量时，`TRUST_PROXY=true` 使用此列表，`false` 时为空 |

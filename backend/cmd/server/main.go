@@ -46,6 +46,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if err = cfg.ValidateSecrets(); err != nil {
+		return err
+	}
 	loc, err := time.LoadLocation(cfg.TZ)
 	if err != nil {
 		return fmt.Errorf("timezone: %w", err)
@@ -59,14 +62,7 @@ func run() error {
 	if err = database.Migrate(db); err != nil {
 		return err
 	}
-	empty, err := database.UsersEmpty(db)
-	if err != nil {
-		return err
-	}
-	if err = cfg.ValidateSecrets(empty); err != nil {
-		return err
-	}
-	if err = database.EnsureAdminSeed(db, cfg.AuthUsername, cfg.AuthPassword); err != nil {
+	if err = database.SyncAdmin(db, cfg.AuthUsername, cfg.AuthPassword); err != nil {
 		return err
 	}
 	prefs, err := database.GetPreferences(db, database.DefaultPreferences(cfg.RetentionDays, cfg.SnapshotIntervalMin, cfg.LogPersistLevel))

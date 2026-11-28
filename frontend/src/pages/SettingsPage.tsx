@@ -35,15 +35,11 @@ export default function SettingsPage() {
   const [dnsType, setDnsType] = useState('A');
   const [dnsResult, setDnsResult] = useState('');
   const [confirm, setConfirm] = useState<Confirmation | null>(null);
-  const [current, setCurrent] = useState('');
-  const [password, setPassword] = useState('');
-  const [repeat, setRepeat] = useState('');
   const [draftEdits, setDraftEdits] = useState<Partial<PrefsDraft>>({});
   const [savingDraft, setSavingDraft] = useState(false);
   const prefs = usePrefsStore(s => s.prefs);
   const savePrefs = usePrefsStore(s => s.savePrefs);
   const username = useAuthStore(s => s.user?.username);
-  const updatePassword = useAuthStore(s => s.updatePassword);
   const logout = useAuthStore(s => s.logout);
   const status = useLiveStore(s => s.status);
   const showError = useToastStore(s => s.error);
@@ -298,25 +294,9 @@ export default function SettingsPage() {
    · 版本：
   {status?.version || '未知'}
 </div>
-        <form className="grid gap-2 sm:grid-cols-3" onSubmit={e => {
-        e.preventDefault();
-        const passwordBytes = new TextEncoder().encode(password).length;
-        if (passwordBytes < 8 || passwordBytes > 72 || password !== repeat) {
-          showError('新密码须为 8–72 个 UTF-8 字节，且两次输入须一致');
-          return;
-        }
-        void updatePassword(current, password).then(() => {
-          setCurrent('');
-          setPassword('');
-          setRepeat('');
-          showSuccess('密码已更新');
-        }).catch(() => showError('修改密码失败'));
-      }}>
-          <Input type="password" autoComplete="current-password" placeholder="当前密码" value={current} onChange={e => setCurrent(e.target.value)} required />
-          <Input type="password" autoComplete="new-password" placeholder="新密码（8–72 字节）" value={password} onChange={e => setPassword(e.target.value)} required />
-          <Input type="password" autoComplete="new-password" placeholder="确认新密码" value={repeat} onChange={e => setRepeat(e.target.value)} required />
-          <Button type="submit">修改密码</Button>
-        </form>
+        <p className="text-sm text-zinc-500">
+          管理员用户名和密码由 <code>.env</code> 中的 <code>AUTH_USERNAME</code> 和 <code>AUTH_PASSWORD</code> 配置。修改后，重建并启动容器以应用更改。
+        </p>
         <Button onClick={() => void logout()}>退出登录</Button>
       </Card>
       <ConfirmDialog open={!!confirm} onClose={() => setConfirm(null)} title="确认操作" danger onConfirm={() => {

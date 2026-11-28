@@ -35,7 +35,7 @@ func newTestDeck(t *testing.T, cfg config.Config, upstream http.Handler) (*api.S
 	if err := database.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.EnsureAdminSeed(db, "admin", "good-password"); err != nil {
+	if err := database.SyncAdmin(db, "admin", "good-password"); err != nil {
 		t.Fatal(err)
 	}
 	var client *mihomo.Client
@@ -68,65 +68,6 @@ func withSession(req *http.Request, login *httptest.ResponseRecorder, csrf strin
 	}
 	req.Header.Set("X-CSRF-Token", csrf)
 	return req
-}
-
-func TestConcurrentLoginAndPasswordChanges(t *testing.T) {
-	deck, db := newTestDeck(t, config.Config{}, nil)
-	initial := loginToDeck(deck, "admin", "good-password")
-	csrf := loginCSRF(t, initial)
-	start := make(chan struct{})
-	results := make(chan *httptest.ResponseRecorder, 3)
-	for _, next := range []string{"new-password-one", "new-password-two"} {
-		req := jsonRequest("POST", "/api/auth/password", strings.NewReader(fmt.Sprintf("{\"currentPassword\":\"good-password\",\"newPassword\":%q}", next)))
-		withSession(req, initial, csrf)
-		go func() {
-			<-start
-			results <- serveDeck(deck, req)
-		}()
-	}
-	loginResult := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		<-start
-		loginResult <- loginToDeck(deck, "admin", "good-password")
-	}()
-	close(start)
-	successes := 0
-	var winner *httptest.ResponseRecorder
-	for i := 0; i < 2; i++ {
-		rec := <-results
-		switch rec.Code {
-		case http.StatusOK:
-			successes++
-			winner = rec
-		case http.StatusUnauthorized:
-			if rec.Header().Get("X-Deck-Auth-Error") != "1" {
-				t.Fatal("missing auth error header")
-			}
-		default:
-			t.Fatalf("password change returned %d: %s", rec.Code, rec.Body)
-		}
-	}
-	stale := <-loginResult
-	if successes != 1 {
-		t.Fatalf("%d concurrent password changes succeeded", successes)
-	}
-	switch stale.Code {
-	case http.StatusOK:
-		rr := serveDeck(deck, withSession(httptest.NewRequest("POST", "/api/auth/refresh", nil), stale, ""))
-		if rr.Code != http.StatusUnauthorized {
-			t.Fatalf("old-password login kept a refresh token: %d", rr.Code)
-		}
-	case http.StatusUnauthorized:
-	default:
-		t.Fatalf("old-password login returned %d: %s", stale.Code, stale.Body)
-	}
-	if rr := serveDeck(deck, withSession(httptest.NewRequest("POST", "/api/auth/refresh", nil), winner, "")); rr.Code != http.StatusOK {
-		t.Fatalf("winning change did not issue a refresh token: %d", rr.Code)
-	}
-	var live int
-	if err := db.QueryRow("SELECT count(*) FROM refresh_tokens WHERE revoked_at IS NULL").Scan(&live); err != nil || live != 1 {
-		t.Fatalf("active refresh tokens %d, error %v", live, err)
-	}
 }
 
 func TestConcurrentLoginFailuresReserveAttemptSlots(t *testing.T) {
@@ -240,20 +181,6 @@ func expectSocketClosed(t *testing.T, conn *websocket.Conn) {
 	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		t.Fatal("WebSocket stayed open")
 	}
-}
-
-func TestLiveSocketClosesOnPasswordChange(t *testing.T) {
-	deck, _ := newTestDeck(t, config.Config{}, nil)
-	server := httptest.NewServer(deck)
-	defer server.Close()
-	login := loginToDeck(deck, "admin", "good-password")
-	csrf := loginCSRF(t, login)
-	conn := openLive(t, server, accessCookie(t, login))
-	req := jsonRequest("POST", "/api/auth/password", strings.NewReader("{\"currentPassword\":\"good-password\",\"newPassword\":\"new-password\"}"))
-	if rec := serveDeck(deck, withSession(req, login, csrf)); rec.Code != http.StatusOK {
-		t.Fatalf("password change: %d %s", rec.Code, rec.Body)
-	}
-	expectSocketClosed(t, conn)
 }
 
 func TestLogoutRevokesRotatedRefreshSessionAndClosesLiveSocket(t *testing.T) {
@@ -457,17 +384,13 @@ func TestAuthOriginJSONAndNoStore(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	login := serveDeck(deck, req)
 	csrf := loginCSRF(t, login)
-	pw := httptest.NewRequest("POST", "/api/auth/password", strings.NewReader("{}"))
-	if rec := serveDeck(deck, withSession(pw, login, csrf)); rec.Code != http.StatusUnsupportedMediaType {
-		t.Errorf("non-JSON password change returned %d", rec.Code)
+	removed := jsonRequest("POST", "/api/auth/password", strings.NewReader("{}"))
+	if rec := serveDeck(deck, withSession(removed, login, csrf)); rec.Code != http.StatusNotFound {
+		t.Errorf("removed password route returned %d", rec.Code)
 	}
 	oversized := strings.Repeat("界", 25)
 	if rec := loginToDeck(deck, "admin", oversized); rec.Code != http.StatusBadRequest {
 		t.Errorf("oversized login password returned %d", rec.Code)
-	}
-	pw = jsonRequest("POST", "/api/auth/password", strings.NewReader(fmt.Sprintf("{\"currentPassword\":\"good-password\",\"newPassword\":%q}", oversized)))
-	if rec := serveDeck(deck, withSession(pw, login, csrf)); rec.Code != http.StatusBadRequest {
-		t.Errorf("oversized new password returned %d", rec.Code)
 	}
 	for _, path := range []string{"/api/auth/me", "/api/overview", "/api/preferences", "/api/telemetry/delays"} {
 		rec := serveDeck(deck, httptest.NewRequest("GET", path, nil))

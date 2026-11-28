@@ -19,30 +19,37 @@ type RefreshToken struct {
 	ExpiresAt                int64
 }
 
-func UsersEmpty(db *sql.DB) (bool, error) {
-	var n int
-	err := db.QueryRow("SELECT count(*) FROM users").Scan(&n)
-	return n == 0, err
-}
-func EnsureAdminSeed(db *sql.DB, username, password string) error {
+func SyncAdmin(db *sql.DB, username, password string) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var n int
-	if err = tx.QueryRow("SELECT count(*) FROM users").Scan(&n); err != nil {
+	var u User
+	err = tx.QueryRow("SELECT id,username,password_hash,token_version FROM users ORDER BY id LIMIT 1").Scan(&u.ID, &u.Username, &u.PasswordHash, &u.TokenVersion)
+	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
-	if n == 0 {
-		hash, e := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-		if e != nil {
-			return e
-		}
-		now := time.Now().Unix()
+	if err == nil && u.Username == username && bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) == nil {
+		return tx.Commit()
+	}
+	newUser := err == sql.ErrNoRows
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	if newUser {
 		if _, err = tx.Exec("INSERT INTO users(username,password_hash,created_at,updated_at) VALUES(?,?,?,?)", username, string(hash), now, now); err != nil {
 			return err
 		}
+		return tx.Commit()
+	}
+	if _, err = tx.Exec("UPDATE users SET username=?,password_hash=?,token_version=token_version+1,updated_at=? WHERE id=?", username, string(hash), now, u.ID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("UPDATE refresh_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, u.ID); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -56,53 +63,12 @@ func GetUserByID(db *sql.DB, id int64) (User, error) {
 	err := db.QueryRow("SELECT id,username,password_hash,token_version FROM users WHERE id=?", id).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.TokenVersion)
 	return u, err
 }
-func UpdatePassword(db *sql.DB, id, expectedVersion int64, password string) error {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return err
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	result, err := tx.Exec("UPDATE users SET password_hash=?,token_version=token_version+1,updated_at=? WHERE id=? AND token_version=?", string(hash), time.Now().Unix(), id, expectedVersion)
-	if err != nil {
-		return err
-	}
-	n, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n != 1 {
-		return sql.ErrNoRows
-	}
-	if _, err = tx.Exec("UPDATE refresh_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", time.Now().Unix(), id); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-func CreateRefreshTokenIfVersion(db *sql.DB, t RefreshToken, expectedVersion int64) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var version int64
-	if err = tx.QueryRow("SELECT token_version FROM users WHERE id=?", t.UserID).Scan(&version); err != nil {
-		return err
-	}
-	if version != expectedVersion {
-		return sql.ErrNoRows
-	}
-	if err = insertRefreshToken(tx, t, time.Now().Unix()); err != nil {
-		return err
-	}
-	return tx.Commit()
+func CreateRefreshToken(db *sql.DB, t RefreshToken) error {
+	return insertRefreshToken(db, t, time.Now().Unix())
 }
 
-func insertRefreshToken(tx *sql.Tx, t RefreshToken, now int64) error {
-	_, err := tx.Exec("INSERT INTO refresh_tokens(id,user_id,token_hash,user_agent,ip,expires_at,created_at,session_id) VALUES(?,?,?,?,?,?,?,?)", t.ID, t.UserID, t.TokenHash, t.UserAgent, t.IP, t.ExpiresAt, now, t.SessionID)
+func insertRefreshToken(db authExecer, t RefreshToken, now int64) error {
+	_, err := db.Exec("INSERT INTO refresh_tokens(id,user_id,token_hash,user_agent,ip,expires_at,created_at,session_id) VALUES(?,?,?,?,?,?,?,?)", t.ID, t.UserID, t.TokenHash, t.UserAgent, t.IP, t.ExpiresAt, now, t.SessionID)
 	return err
 }
 

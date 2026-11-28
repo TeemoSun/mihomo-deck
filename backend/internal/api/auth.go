@@ -159,7 +159,7 @@ func (s *Server) newRefresh(r *http.Request, u database.User) (string, database.
 }
 
 func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, u database.User, token string, t database.RefreshToken) error {
-	if err := database.CreateRefreshTokenIfVersion(s.db, t, u.TokenVersion); err != nil {
+	if err := database.CreateRefreshToken(s.db, t); err != nil {
 		return err
 	}
 	return s.cookies(w, r, u, token, t.SessionID)
@@ -269,42 +269,4 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	u := user(r)
 	write(w, map[string]any{"username": u.Username, "csrfToken": s.csrf(u)})
-}
-
-func (s *Server) password(w http.ResponseWriter, r *http.Request) {
-	var b struct {
-		CurrentPassword string `json:"currentPassword"`
-		NewPassword     string `json:"newPassword"`
-	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&b) != nil ||
-		!config.ValidPasswordLength(b.CurrentPassword) || !config.ValidPassword(b.NewPassword) {
-		fail(w, 400)
-		return
-	}
-	if !s.acquireBcrypt() {
-		fail(w, 429)
-		return
-	}
-	defer s.releaseBcrypt()
-	u := user(r)
-	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(b.CurrentPassword)) != nil {
-		failAuth(w)
-		return
-	}
-	token, t, err := s.newRefresh(r, u)
-	if err != nil {
-		fail(w, 500)
-		return
-	}
-	if err = database.UpdatePassword(s.db, u.ID, u.TokenVersion, b.NewPassword); err != nil {
-		authDBError(w, err)
-		return
-	}
-	s.CloseUserSockets(u.ID)
-	u.TokenVersion++
-	if err = s.issueSession(w, r, u, token, t); err != nil {
-		authDBError(w, err)
-		return
-	}
-	write(w, map[string]any{"csrfToken": s.csrf(u)})
 }

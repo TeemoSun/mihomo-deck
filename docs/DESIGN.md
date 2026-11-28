@@ -34,7 +34,7 @@
 
 ### 核心模块划分
 - `backend/cmd/server/main.go`：配置加载、密钥校验、SQLite 初始化、Mihomo 客户端与采集器启动、HTTP/WS 服务与优雅停机、`-healthcheck` 探针。
-- `backend/internal/config` 负责读取环境变量与校验启动配置。`AUTH_PASSWORD` 在 `users` 表为空时校验，`JWT_SECRET` 每次启动均校验，`MIHOMO_SECRET` 可以为空。
+- `backend/internal/config` 负责读取环境变量与校验启动配置。每次启动都校验 `AUTH_USERNAME`、`AUTH_PASSWORD` 和 `JWT_SECRET`。`MIHOMO_SECRET` 可以为空。
 - `backend/internal/database`：基于 `modernc.org/sqlite` 的纯 Go SQLite 层（`CGO_ENABLED=0`），开启 WAL、外键约束、`busy_timeout=5000`、`MaxOpenConns(1)`。
 - `backend/internal/mihomo` 封装控制与采集所需的 Mihomo REST 请求和 WebSocket 流。
 - `backend/internal/collector`：常驻后台采集引擎，负责断线指数退避重连、连接关闭 diff 落盘、跨重启流量差值累加、小时级聚合、低频订阅/节点快照与 30 天（可配）过期数据自动清理。
@@ -47,7 +47,7 @@
 
 1. **`users`**：单管理员账号表
    - `id` INTEGER PK, `username` TEXT UNIQUE, `password_hash` TEXT, `token_version` INTEGER, `created_at` INTEGER, `updated_at` INTEGER
-   - 仅当表为空时由 `AUTH_USERNAME` / `AUTH_PASSWORD` 初始化；网页修改密码后持久化到本表并递增 `token_version`，重启容器保留新密码。
+   - 每次启动都将 `.env` 提供的 `AUTH_USERNAME` 和 `AUTH_PASSWORD` 同步到本表。用户名或密码变更时，在同一事务中更新用户名和 bcrypt 哈希、递增 `token_version` 并撤销刷新令牌，使旧会话失效。凭据相同时保留账号记录和会话。
 2. **`refresh_tokens`**：长期免登会话（默认 30 天）
    - `id` TEXT PK, `user_id` INTEGER FK, `token_hash` TEXT UNIQUE, `user_agent` TEXT, `ip` TEXT, `expires_at` INTEGER, `revoked_at` INTEGER, `created_at` INTEGER
 3. **`user_preferences`**：前端偏好与可调系统策略（KV JSON）
@@ -79,7 +79,7 @@
 - **登录态**。`POST /api/auth/login` 校验 bcrypt 密码后下发以下 Cookie，并在响应体返回 `csrfToken`。
   - `deck_access` Cookie（HttpOnly, SameSite=Lax, Path=/, 15 分钟）
   - `deck_refresh` Cookie（HttpOnly, SameSite=Lax, Path=/api/auth, 30 天）
-- **密码校验**。初始化和设置新密码时，密码须为 8–72 个 UTF-8 字节，且避开弱占位值。登录和改密时提交的当前密码也检查此字节长度。
+- **密码校验**。启动时要求 `AUTH_PASSWORD` 为 8–72 个 UTF-8 字节，且避开弱占位值。登录时也检查密码的字节长度。
 - **CSRF**。`csrfToken` 由 `JWT_SECRET` 对用户 ID 与 `token_version` 做 HMAC-SHA256 派生。鉴权后的 `POST`、`PUT`、`PATCH`、`DELETE` 请求须发送 `X-CSRF-Token`，校验失败返回 `403`。这包括节点测速、策略组测速和代理提供者健康检查。`POST /api/auth/login`、`POST /api/auth/refresh` 和 `POST /api/auth/logout` 在提供 `Origin` 时校验其主机与端口是否匹配请求的 `Host`。
 - **认证失败标记**。Deck 的认证失败返回 `401`，附带 `X-Deck-Auth-Error: 1`。转发的 Mihomo `401` 保留状态码，前端根据响应头识别 Deck 的认证失败。
 - **HTTP / HTTPS 兼容**。
@@ -142,7 +142,7 @@ Deck 收到测速和代理提供者健康检查的 `POST` 后，向 Mihomo 发�
   3. **连接审计（`/connections`）**：双 Tab（实时活跃连接 / 历史已关闭连接），支持筛选、详情抽屉（完整策略链、规则、协议元数据）、单条/全部断开（全部断开二次确认）。
   4. **订阅与规则（`/providers`）**：Proxy Providers 订阅列表与一键更新/健康检查、Rule Providers 更新、Rules 搜索与命中计数。
   5. **运行日志（`/logs`）**：双 Tab（实时日志流 / 历史持久化日志），级别过滤、关键字搜索、暂停滚动与复制。
-  6. **内核与设置（`/settings`）**：Mihomo 运行参数在线修改、诊断工具（DNS 查询、清空 FakeIP/DNS 缓存、更新 Geo 数据库、重载配置、重启内核——高危项均带二次确认）、持久化清理策略与 DB 状态查看、前端偏好管理、管理员改密与登出。
+  6. **内核与设置（`/settings`）**：Mihomo 运行参数在线修改、诊断工具（DNS 查询、清空 FakeIP/DNS 缓存、更新 Geo 数据库、重载配置、重启内核——高危项均带二次确认）、持久化清理策略与 DB 状态查看、前端偏好管理、当前账号信息与登出。
 
 ---
 
@@ -162,10 +162,13 @@ Deck 收到测速和代理提供者健康检查的 `POST` 后，向 Mihomo 发�
 | --- | --- |
 | `MIHOMO_URL` | 示例 Compose 默认为 `http://mihomo:9090`，可在 `.env` 中设为网络外可达的控制器地址。独立运行 Go 服务时默认为 `http://127.0.0.1:9090` |
 | `MIHOMO_SECRET` | 默认为空，控制器配置了 `secret` 时填入相同值 |
-| `AUTH_PASSWORD` | Compose 允许留空。复用非空 `users` 表时直接使用数据库中的账号，初始化空表仍由 Go 校验密码 |
+| `AUTH_USERNAME` | 管理员用户名，由 `.env` 配置，默认 `admin`，每次启动校验非空白 |
+| `AUTH_PASSWORD` | 管理员密码，由 `.env` 配置，Compose 要求非空，Go 每次启动校验长度和弱占位值 |
 | `JWT_SECRET` | Compose 要求非空，Go 每次启动校验至少 16 字节且避开弱占位值 |
 | `TRUST_PROXY` | 默认为 `false`，部署在可信反向代理之后可设为 `true` |
 | `TRUSTED_PROXIES` | 建议设为实际反向代理的 CIDR 列表。Compose 在变量未设置或为空时传入 `127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`。独立运行 Go 服务且未设置本变量时，仅 `TRUST_PROXY=true` 会使用该列表 |
+
+修改 `.env` 中的管理员凭据后，运行 `docker compose up -d mihomo-deck` 以应用新的环境变量。Deck 在启动时同步凭据并撤销旧会话。
 
 容器启动时检查 `appuser`（UID/GID `1000`）对 `/data` 的写入和访问权限，必要时调整所有权。应用进程和容器健康探针均以 `appuser` 运行。
 

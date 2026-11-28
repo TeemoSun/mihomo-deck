@@ -45,8 +45,8 @@ docker build -t mihomo-deck:local .
 
 1. **Public repo hygiene**: NEVER commit `.env`, `*.db`, real `MIHOMO_SECRET`, real passwords, or subscription URLs.
 2. **No CGO**: SQLite MUST remain `modernc.org/sqlite` so `CGO_ENABLED=0` static builds work cleanly.
-3. **Secret validation**: Reject empty or weak placeholder `AUTH_PASSWORD` / `JWT_SECRET` (`admin`, `password`, `secret`, `changeme`, `change-me`, `123456`). Do NOT reject short/simple `MIHOMO_SECRET` (some users configure simple LAN controller secrets or leave it empty).
-4. **Password persistence**: Seed admin from `AUTH_USERNAME`/`AUTH_PASSWORD` only when `users` table is empty. Changing password in the UI persists in SQLite across container restarts.
+3. **Secret validation** requires a nonblank `AUTH_USERNAME` on every startup. `AUTH_PASSWORD` must be 8–72 UTF-8 bytes and `JWT_SECRET` must be at least 16 bytes. Reject weak placeholders (`admin`, `password`, `secret`, `changeme`, `change-me`, `123456`) for both. Accept empty or short `MIHOMO_SECRET` values.
+4. **Admin credentials** come from `.env` via `AUTH_USERNAME` and `AUTH_PASSWORD`. Sync them into SQLite on every startup. Preserve existing sessions when credentials match and revoke them atomically when either credential changes. Apply `.env` edits in Compose with `docker compose up -d mihomo-deck`.
 5. **No frontend backend-URL modal**: Mihomo upstream is fixed server-side via `MIHOMO_URL` & `MIHOMO_SECRET`; the browser never receives `MIHOMO_SECRET`.
 6. **CSP & Security Headers**: Keep `script-src 'self'` (no inline scripts in `index.html`). Cookies default to `Secure=false` for LAN HTTP compatibility, toggled via `COOKIE_SECURE` / `TRUST_PROXY`.
 7. **Reset-safe traffic tracking**: Always handle `currTotal < lastTotal` (Mihomo restart) cleanly without losing or negative-wrapping `cumulative_up` / `cumulative_down`.

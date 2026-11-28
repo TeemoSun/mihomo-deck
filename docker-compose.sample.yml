@@ -33,9 +33,8 @@ services:
       MIHOMO_URL: ${MIHOMO_URL:-http://mihomo:9090}
       MIHOMO_SECRET: ${MIHOMO_SECRET:-}
       AUTH_USERNAME: ${AUTH_USERNAME:-admin}
-      # Go requires a strong bootstrap password when the users table is empty.
-      # Restarts with a seeded SQLite database can leave AUTH_PASSWORD unset.
-      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      # Set the administrator password in .env for every startup.
+      AUTH_PASSWORD: ${AUTH_PASSWORD:?请先在 .env 中设置 AUTH_PASSWORD}
       JWT_SECRET: ${JWT_SECRET:?请先在 .env 中设置 JWT_SECRET}
       TRUST_PROXY: ${TRUST_PROXY:-false}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}

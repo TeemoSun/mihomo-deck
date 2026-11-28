@@ -14,7 +14,6 @@ interface State {
   login: (username: string, password: string) => Promise<void>
   checkAuth: () => Promise<void>
   logout: () => Promise<void>
-  updatePassword: (currentPassword: string, newPassword: string) => Promise<void>
 }
 
 export const useAuthStore = create<State>((set, get) => {
@@ -75,11 +74,6 @@ export const useAuthStore = create<State>((set, get) => {
         }
       }
       if (!sessionSignal.aborted) get().clearSession()
-    },
-    updatePassword: async (currentPassword, newPassword) => {
-      const { sessionSignal } = get()
-      const result = await api.password(currentPassword, newPassword)
-      if (!sessionSignal.aborted) get().setCsrfToken(result.csrfToken)
     },
   }
 })
