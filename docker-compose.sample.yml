@@ -5,7 +5,8 @@ services:
     restart: unless-stopped
     ports:
       - "7890:7890"
-      - "9090:9090"
+      # Optional direct host access to the Mihomo controller bypasses Deck auth.
+      # - "9090:9090"
     volumes:
       - ./data:/root/.config/mihomo
 
@@ -20,7 +21,7 @@ services:
     depends_on:
       - mihomo
     healthcheck:
-      test: ["CMD", "/app/mihomo-deck", "-healthcheck"]
+      test: ["CMD", "su-exec", "appuser", "/app/mihomo-deck", "-healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -29,13 +30,15 @@ services:
       PORT: "8080"
       DB_PATH: /data/mihomo-deck.db
       STATIC_DIR: /app/static
-      # Use http://mihomo:9090 if the host firewall blocks bridge-to-host LAN IP access.
-      MIHOMO_URL: http://192.168.5.2:9090
+      MIHOMO_URL: ${MIHOMO_URL:-http://mihomo:9090}
       MIHOMO_SECRET: ${MIHOMO_SECRET:-}
       AUTH_USERNAME: ${AUTH_USERNAME:-admin}
-      AUTH_PASSWORD: ${AUTH_PASSWORD:?请先在 .env 中设置 AUTH_PASSWORD}
+      # Go requires a strong bootstrap password when the users table is empty.
+      # Restarts with a seeded SQLite database can leave AUTH_PASSWORD unset.
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:?请先在 .env 中设置 JWT_SECRET}
       TRUST_PROXY: ${TRUST_PROXY:-false}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
       SNAPSHOT_INTERVAL_MIN: ${SNAPSHOT_INTERVAL_MIN:-30}

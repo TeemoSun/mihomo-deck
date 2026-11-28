@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -33,8 +34,13 @@ type TrafficPoint struct {
 	MaxConns    int64 `json:"maxConns"`
 }
 
-func GetTrafficSummary(db *sql.DB, now time.Time) (s TrafficSummary, err error) {
-	err = db.QueryRow("SELECT cumulative_up,cumulative_down FROM traffic_cursor WHERE id=1").Scan(&s.CumulativeUp, &s.CumulativeDown)
+func GetTrafficSummary(ctx context.Context, db *sql.DB, now time.Time) (s TrafficSummary, err error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+	err = tx.QueryRowContext(ctx, "SELECT cumulative_up,cumulative_down FROM traffic_cursor WHERE id=1").Scan(&s.CumulativeUp, &s.CumulativeDown)
 	if err == sql.ErrNoRows {
 		err = nil
 	}
@@ -46,12 +52,12 @@ func GetTrafficSummary(db *sql.DB, now time.Time) (s TrafficSummary, err error) 
 		since    time.Time
 		up, down *int64
 	}{{midnight, &s.TodayUp, &s.TodayDown}, {now.Add(-7 * 24 * time.Hour), &s.WeekUp, &s.WeekDown}, {now.Add(-30 * 24 * time.Hour), &s.MonthUp, &s.MonthDown}} {
-		err = db.QueryRow("SELECT coalesce(sum(up_bytes),0),coalesce(sum(down_bytes),0) FROM traffic_hourly WHERE hour_ts>=? AND hour_ts<=?", v.since.Unix(), now.Unix()).Scan(v.up, v.down)
+		err = tx.QueryRowContext(ctx, "SELECT coalesce(sum(up_bytes),0),coalesce(sum(down_bytes),0) FROM traffic_hourly WHERE hour_ts>=? AND hour_ts<=?", v.since.Unix(), now.Unix()).Scan(v.up, v.down)
 		if err != nil {
 			return
 		}
 	}
-	return
+	return s, tx.Commit()
 }
 func QueryTrafficSeries(db *sql.DB, key string, now time.Time) ([]TrafficPoint, error) {
 	var duration time.Duration
@@ -190,15 +196,28 @@ func pagination(page, size int) (int, int) {
 	}
 	return page, size
 }
-func QueryConnections(db *sql.DB, f ConnectionFilter) (p PagedConnections, err error) {
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`)
+
+func containsPattern(value string) string {
+	return "%" + likeEscaper.Replace(value) + "%"
+}
+
+func QueryConnections(ctx context.Context, db *sql.DB, f ConnectionFilter) (p PagedConnections, err error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
 	p.Page, p.PageSize = pagination(f.Page, f.PageSize)
 	p.Items = []ClosedConnection{}
 	w := []string{"1=1"}
 	args := []any{}
 	if f.Q != "" {
-		w = append(w, "(host LIKE ? OR dst_ip LIKE ? OR src_ip LIKE ? OR primary_proxy LIKE ? OR rule_payload LIKE ? OR rule LIKE ?)")
+		w = append(w, `(host LIKE ? ESCAPE '\' OR dst_ip LIKE ? ESCAPE '\' OR src_ip LIKE ? ESCAPE '\' OR primary_proxy LIKE ? ESCAPE '\' OR rule_payload LIKE ? ESCAPE '\' OR rule LIKE ? ESCAPE '\')`)
+		pattern := containsPattern(f.Q)
 		for i := 0; i < 6; i++ {
-			args = append(args, "%"+f.Q+"%")
+			args = append(args, pattern)
 		}
 	}
 	for _, x := range []struct{ col, val string }{{"host", f.Host}, {"primary_proxy", f.Proxy}, {"src_ip", f.SrcIP}, {"rule", f.Rule}} {
@@ -216,11 +235,11 @@ func QueryConnections(db *sql.DB, f ConnectionFilter) (p PagedConnections, err e
 		args = append(args, f.To)
 	}
 	where := strings.Join(w, " AND ")
-	if err = db.QueryRow("SELECT count(*) FROM connection_history WHERE "+where, args...).Scan(&p.Total); err != nil {
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM connection_history WHERE "+where, args...).Scan(&p.Total); err != nil {
 		return
 	}
 	args = append(args, p.PageSize, (p.Page-1)*p.PageSize)
-	rows, e := db.Query("SELECT id,coalesce(host,''),coalesce(dst_ip,''),coalesce(dst_port,''),coalesce(src_ip,''),coalesce(src_port,''),coalesce(network,''),coalesce(conn_type,''),coalesce(inbound_name,''),coalesce(rule,''),coalesce(rule_payload,''),coalesce(chain_json,''),coalesce(primary_proxy,''),coalesce(provider_name,''),coalesce(upload_bytes,0),coalesce(download_bytes,0),coalesce(start_at,0),coalesce(closed_at,0),coalesce(duration_ms,0) FROM connection_history WHERE "+where+" ORDER BY closed_at DESC,id DESC LIMIT ? OFFSET ?", args...)
+	rows, e := tx.QueryContext(ctx, "SELECT id,coalesce(host,''),coalesce(dst_ip,''),coalesce(dst_port,''),coalesce(src_ip,''),coalesce(src_port,''),coalesce(network,''),coalesce(conn_type,''),coalesce(inbound_name,''),coalesce(rule,''),coalesce(rule_payload,''),coalesce(chain_json,''),coalesce(primary_proxy,''),coalesce(provider_name,''),coalesce(upload_bytes,0),coalesce(download_bytes,0),coalesce(start_at,0),coalesce(closed_at,0),coalesce(duration_ms,0) FROM connection_history WHERE "+where+" ORDER BY closed_at DESC,id DESC LIMIT ? OFFSET ?", args...)
 	if e != nil {
 		err = e
 		return
@@ -234,8 +253,10 @@ func QueryConnections(db *sql.DB, f ConnectionFilter) (p PagedConnections, err e
 		}
 		p.Items = append(p.Items, x)
 	}
-	err = rows.Err()
-	return
+	if err = rows.Err(); err != nil {
+		return
+	}
+	return p, tx.Commit()
 }
 func TopStats(db *sql.DB, since time.Time, limit int) (r TopStatsResult, err error) {
 	if limit <= 0 {
@@ -303,7 +324,12 @@ func InsertLogs(db *sql.DB, entries []LogEntry) error {
 	}
 	return tx.Commit()
 }
-func QueryLogs(db *sql.DB, f LogFilter) (p PagedLogs, err error) {
+func QueryLogs(ctx context.Context, db *sql.DB, f LogFilter) (p PagedLogs, err error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
 	p.Page, p.PageSize = pagination(f.Page, f.PageSize)
 	p.Items = []LogEntry{}
 	w := []string{"1=1"}
@@ -313,8 +339,8 @@ func QueryLogs(db *sql.DB, f LogFilter) (p PagedLogs, err error) {
 		a = append(a, f.Level)
 	}
 	if f.Q != "" {
-		w = append(w, "payload LIKE ?")
-		a = append(a, "%"+f.Q+"%")
+		w = append(w, `payload LIKE ? ESCAPE '\'`)
+		a = append(a, containsPattern(f.Q))
 	}
 	if f.From != 0 {
 		w = append(w, "ts>=?")
@@ -325,11 +351,11 @@ func QueryLogs(db *sql.DB, f LogFilter) (p PagedLogs, err error) {
 		a = append(a, f.To)
 	}
 	where := strings.Join(w, " AND ")
-	if err = db.QueryRow("SELECT count(*) FROM log_entries WHERE "+where, a...).Scan(&p.Total); err != nil {
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM log_entries WHERE "+where, a...).Scan(&p.Total); err != nil {
 		return
 	}
 	a = append(a, p.PageSize, (p.Page-1)*p.PageSize)
-	rows, e := db.Query("SELECT id,ts,level,payload FROM log_entries WHERE "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", a...)
+	rows, e := tx.QueryContext(ctx, "SELECT id,ts,level,payload FROM log_entries WHERE "+where+" ORDER BY id DESC LIMIT ? OFFSET ?", a...)
 	if e != nil {
 		err = e
 		return
@@ -342,20 +368,23 @@ func QueryLogs(db *sql.DB, f LogFilter) (p PagedLogs, err error) {
 		}
 		p.Items = append(p.Items, x)
 	}
-	err = rows.Err()
-	return
+	if err = rows.Err(); err != nil {
+		return
+	}
+	return p, tx.Commit()
 }
 func ClearLogs(db *sql.DB) error { _, err := db.Exec("DELETE FROM log_entries"); return err }
 
 type DelayRecord struct {
-	ID        int64  `json:"id"`
-	ProxyName string `json:"proxyName"`
-	GroupName string `json:"groupName"`
-	TestURL   string `json:"testUrl"`
-	DelayMS   int64  `json:"delayMs"`
-	OK        bool   `json:"ok"`
-	Source    string `json:"source"`
-	TestedAt  int64  `json:"testedAt"`
+	ID           int64  `json:"id"`
+	ProxyName    string `json:"proxyName"`
+	GroupName    string `json:"groupName"`
+	ProviderName string `json:"providerName"`
+	TestURL      string `json:"testUrl"`
+	DelayMS      int64  `json:"delayMs"`
+	OK           bool   `json:"ok"`
+	Source       string `json:"source"`
+	TestedAt     int64  `json:"testedAt"`
 }
 type ProviderSnapshot struct {
 	ID            int64  `json:"id"`
@@ -376,17 +405,25 @@ func InsertDelays(db *sql.DB, items []DelayRecord) error {
 	}
 	defer tx.Rollback()
 	for _, x := range items {
-		if _, e = tx.Exec("INSERT INTO delay_history(proxy_name,group_name,test_url,delay_ms,ok,source,tested_at) VALUES(?,?,?,?,?,?,?)", x.ProxyName, x.GroupName, x.TestURL, x.DelayMS, x.OK, x.Source, x.TestedAt); e != nil {
+		if _, e = tx.Exec("INSERT INTO delay_history(proxy_name,group_name,provider_name,test_url,delay_ms,ok,source,tested_at) VALUES(?,?,?,?,?,?,?,?)", x.ProxyName, x.GroupName, x.ProviderName, x.TestURL, x.DelayMS, x.OK, x.Source, x.TestedAt); e != nil {
 			return e
 		}
 	}
 	return tx.Commit()
 }
-func QueryDelays(db *sql.DB, name string, since time.Time, limit int) ([]DelayRecord, error) {
-	if limit <= 0 {
-		limit = 200
+func QueryDelays(db *sql.DB, name, provider string, since time.Time, limit int) ([]DelayRecord, error) {
+	query := "SELECT id,coalesce(proxy_name,''),coalesce(group_name,''),provider_name,coalesce(test_url,''),coalesce(delay_ms,0),coalesce(ok,0),coalesce(source,''),tested_at FROM delay_history WHERE tested_at>=?"
+	args := []any{since.Unix()}
+	if name != "" {
+		query += " AND proxy_name=?"
+		args = append(args, name)
 	}
-	rows, e := db.Query("SELECT id,proxy_name,group_name,test_url,delay_ms,ok,source,tested_at FROM delay_history WHERE (?='' OR proxy_name=?) AND tested_at>=? ORDER BY tested_at DESC,id DESC LIMIT ?", name, name, since.Unix(), limit)
+	if provider != "" {
+		query += " AND (provider_name=? OR provider_name='')"
+		args = append(args, provider)
+	}
+	args = append(args, max(1, min(limit, 500)))
+	rows, e := db.Query(query+" ORDER BY tested_at DESC,id DESC LIMIT ?", args...)
 	if e != nil {
 		return nil, e
 	}
@@ -394,7 +431,7 @@ func QueryDelays(db *sql.DB, name string, since time.Time, limit int) ([]DelayRe
 	out := []DelayRecord{}
 	for rows.Next() {
 		var x DelayRecord
-		if e = rows.Scan(&x.ID, &x.ProxyName, &x.GroupName, &x.TestURL, &x.DelayMS, &x.OK, &x.Source, &x.TestedAt); e != nil {
+		if e = rows.Scan(&x.ID, &x.ProxyName, &x.GroupName, &x.ProviderName, &x.TestURL, &x.DelayMS, &x.OK, &x.Source, &x.TestedAt); e != nil {
 			return nil, e
 		}
 		out = append(out, x)
@@ -415,10 +452,14 @@ func InsertProviderSnapshots(db *sql.DB, items []ProviderSnapshot) error {
 	return tx.Commit()
 }
 func QueryProviderSnapshots(db *sql.DB, name string, since time.Time, limit int) ([]ProviderSnapshot, error) {
-	if limit <= 0 {
-		limit = 200
+	query := "SELECT id,provider_name,upload_bytes,download_bytes,total_bytes,expire_ts,node_count,alive_count,captured_at FROM provider_snapshots WHERE captured_at>=?"
+	args := []any{since.Unix()}
+	if name != "" {
+		query += " AND provider_name=?"
+		args = append(args, name)
 	}
-	rows, e := db.Query("SELECT id,provider_name,upload_bytes,download_bytes,total_bytes,expire_ts,node_count,alive_count,captured_at FROM provider_snapshots WHERE (?='' OR provider_name=?) AND captured_at>=? ORDER BY captured_at DESC,id DESC LIMIT ?", name, name, since.Unix(), limit)
+	args = append(args, max(1, min(limit, 500)))
+	rows, e := db.Query(query+" ORDER BY captured_at DESC,id DESC LIMIT ?", args...)
 	if e != nil {
 		return nil, e
 	}

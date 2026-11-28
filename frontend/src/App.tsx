@@ -12,12 +12,14 @@ import LogsPage from './pages/LogsPage'
 import SettingsPage from './pages/SettingsPage'
 
 export default function App() {
-  const { user, checking, checkAuth } = useAuthStore()
+  const authenticated = useAuthStore(s => s.user !== null)
+  const checking = useAuthStore(s => s.checking)
+  const checkAuth = useAuthStore(s => s.checkAuth)
   useEffect(() => { void checkAuth() }, [checkAuth])
   return (
     <>
       <ToastContainer />
-      {checking ? <div className="p-8 text-sm text-zinc-500">正在检查登录状态…</div> : !user ? <LoginPage /> : (
+      {checking ? <div className="p-8 text-sm text-zinc-500">正在检查登录状态…</div> : !authenticated ? <LoginPage /> : (
         <BrowserRouter>
           <Routes>
             <Route element={<AppShell />}>

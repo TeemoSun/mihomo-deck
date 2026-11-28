@@ -1,16 +1,20 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
-	"github.com/TeemoSun/mihomo-deck/internal/database"
-	"github.com/TeemoSun/mihomo-deck/internal/mihomo"
-	"github.com/go-chi/chi/v5"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
+
+	"github.com/TeemoSun/mihomo-deck/internal/database"
+	"github.com/TeemoSun/mihomo-deck/internal/mihomo"
+	"github.com/go-chi/chi/v5"
 )
 
 func (s *Server) proxyRouter() http.Handler {
@@ -24,11 +28,11 @@ func (s *Server) proxyRouter() http.Handler {
 	r.Get("/proxies", s.proxy)
 	r.Put("/proxies/{name}", s.proxy)
 	r.Delete("/proxies/{name}", s.proxy)
-	r.Get("/proxies/{name}/delay", s.proxy)
-	r.Get("/group/{name}/delay", s.proxy)
+	r.Post("/proxies/{name}/delay", s.proxy)
+	r.Post("/group/{name}/delay", s.proxy)
 	r.Get("/providers/proxies", s.proxy)
 	r.Put("/providers/proxies/{name}", s.proxy)
-	r.Get("/providers/proxies/{name}/healthcheck", s.proxy)
+	r.Post("/providers/proxies/{name}/healthcheck", s.proxy)
 	r.Get("/providers/rules", s.proxy)
 	r.Put("/providers/rules/{name}", s.proxy)
 	r.Get("/rules", s.proxy)
@@ -47,6 +51,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	pattern := chi.RouteContext(ctx).RoutePattern()
 	var data json.RawMessage
 	var err error
+	expectsJSON := r.Method == http.MethodGet
 	c := s.client
 	switch pattern {
 	case "/api/mihomo/version":
@@ -87,10 +92,15 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			data, err = c.SelectProxy(ctx, name, b.Name)
 		}
 	case "/api/mihomo/proxies/{name}/delay", "/api/mihomo/group/{name}/delay":
+		expectsJSON = true
 		p := s.collector.Preferences()
 		testURL := r.URL.Query().Get("url")
 		if testURL == "" {
 			testURL = p.DelayTestURL
+		}
+		if !mihomo.ValidDelayTestURL(testURL) {
+			fail(w, 400)
+			return
 		}
 		timeout := p.DelayTestTimeout
 		if n, e := strconv.Atoi(r.URL.Query().Get("timeout")); e == nil && n > 0 && n <= 60000 {
@@ -155,7 +165,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				_ = json.Unmarshal(data, &v)
 			}
-			_ = database.InsertDelays(s.db, []database.DelayRecord{{ProxyName: name, TestURL: testURL, DelayMS: v.Delay, OK: err == nil && v.Delay > 0, Source: "manual", TestedAt: time.Now().Unix()}})
+			_ = database.InsertDelays(s.db, []database.DelayRecord{{ProxyName: name, ProviderName: provider, TestURL: testURL, DelayMS: v.Delay, OK: err == nil && v.Delay > 0, Source: "manual", TestedAt: time.Now().Unix()}})
 		}
 	case "/api/mihomo/providers/proxies":
 		data, err = c.ProxyProviders(ctx)
@@ -188,8 +198,13 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		var timeout net.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout() {
+			fail(w, http.StatusGatewayTimeout)
+			return
+		}
 		var upstream *mihomo.UpstreamError
-		if errors.As(err, &upstream) && upstream.StatusCode >= 400 {
+		if errors.As(err, &upstream) && upstream.Err == nil && upstream.StatusCode >= 400 {
 			contentType := "text/plain"
 			if json.Valid(upstream.Body) {
 				contentType = "application/json"
@@ -202,8 +217,13 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		fail(w, 502)
 		return
 	}
-	if len(data) == 0 {
-		w.WriteHeader(204)
+	if !json.Valid(data) {
+		if expectsJSON && len(bytes.TrimSpace(data)) != 0 {
+			fail(w, http.StatusBadGateway)
+			return
+		}
+		// Mihomo commands may acknowledge success with a plain-text or empty body.
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

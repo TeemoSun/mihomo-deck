@@ -78,19 +78,28 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	c.Start(ctx)
-	server := &http.Server{Addr: ":" + cfg.Port, Handler: api.NewRouter(db, cfg, client, c), ReadHeaderTimeout: 10 * time.Second}
+	handler := api.NewRouter(db, cfg, client, c)
+	server := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	errs := make(chan error, 1)
 	go func() { errs <- server.ListenAndServe() }()
 	select {
 	case <-ctx.Done():
 	case err = <-errs:
 		if err != http.ErrServerClosed {
+			handler.CloseAllSockets()
 			c.Stop()
 			return err
 		}
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	handler.CloseAllSockets()
 	err = server.Shutdown(shutdown)
 	c.Stop()
 	return err

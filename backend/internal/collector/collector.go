@@ -1,10 +1,13 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -52,11 +55,16 @@ type ConnectionsSnapshot struct {
 	UploadTotal   int64        `json:"uploadTotal"`
 	Connections   []Connection `json:"connections"`
 }
+type StreamStatus struct {
+	Connected bool   `json:"connected"`
+	LastErr   string `json:"lastErr"`
+}
 type Status struct {
-	Connected  bool   `json:"connected"`
-	LastErr    string `json:"lastErr"`
-	Version    string `json:"version"`
-	LastSeenAt int64  `json:"lastSeenAt"`
+	Connected  bool                    `json:"connected"`
+	LastErr    string                  `json:"lastErr"`
+	Version    string                  `json:"version"`
+	LastSeenAt int64                   `json:"lastSeenAt"`
+	Streams    map[string]StreamStatus `json:"streams"`
 }
 type State struct {
 	Status         Status                   `json:"status"`
@@ -79,15 +87,15 @@ type Collector struct {
 	subscribers map[chan Event]struct{}
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
-	totals      []ConnectionsSnapshot
+	totals      []database.TrafficTotal
 	initial     chan struct{}
 	logConn     *websocket.Conn
-	connected   map[string]bool
 	once        sync.Once
 }
 
 func New(db *sql.DB, client *mihomo.Client, prefs database.Preferences) *Collector {
-	c := &Collector{db: db, client: client, prefs: prefs, active: make(map[string]Connection), subscribers: make(map[chan Event]struct{}), connected: make(map[string]bool), initial: make(chan struct{}, 1)}
+	c := &Collector{db: db, client: client, prefs: copyPreferences(prefs), active: make(map[string]Connection), subscribers: make(map[chan Event]struct{}), initial: make(chan struct{}, 1)}
+	c.state.Status.Streams = map[string]StreamStatus{"traffic": {}, "connections": {}, "memory": {}, "logs": {}}
 	if db != nil {
 		if history, err := database.QueryTrafficSeries(db, "1h", time.Now()); err == nil {
 			if len(history) > 60 {
@@ -104,7 +112,7 @@ func New(db *sql.DB, client *mihomo.Client, prefs database.Preferences) *Collect
 func (c *Collector) SetPreferences(p database.Preferences) {
 	c.mu.Lock()
 	changed := (c.prefs.LogPersistLevel == "debug") != (p.LogPersistLevel == "debug")
-	c.prefs = p
+	c.prefs = copyPreferences(p)
 	conn := c.logConn
 	c.mu.Unlock()
 	if changed && conn != nil {
@@ -114,28 +122,66 @@ func (c *Collector) SetPreferences(p database.Preferences) {
 func (c *Collector) Preferences() database.Preferences {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.prefs
+	return copyPreferences(c.prefs)
 }
+func copyPreferences(p database.Preferences) database.Preferences {
+	p.PinnedProxies = slices.Clone(p.PinnedProxies)
+	p.HiddenGroups = slices.Clone(p.HiddenGroups)
+	return p.Normalized()
+}
+
 func (c *Collector) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.state.Status
+	status := c.state.Status
+	status.Streams = maps.Clone(status.Streams)
+	return status
 }
+
 func (c *Collector) Snapshot() State {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	b, _ := json.Marshal(c.state)
-	var s State
-	_ = json.Unmarshal(b, &s)
+	return c.snapshotLocked()
+}
+
+func (c *Collector) snapshotLocked() State {
+	s := c.state
+	s.Status.Streams = maps.Clone(s.Status.Streams)
+	s.TrafficHistory = slices.Clone(s.TrafficHistory)
+	s.Logs = slices.Clone(s.Logs)
+	s.Connections.Connections = slices.Clone(s.Connections.Connections)
+	for i := range s.Connections.Connections {
+		conn := &s.Connections.Connections[i]
+		conn.Chains = slices.Clone(conn.Chains)
+		conn.ProviderChains = slices.Clone(conn.ProviderChains)
+	}
 	return s
 }
+
 func (c *Collector) Subscribe() (<-chan Event, func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.subscribeLocked()
+}
+
+func (c *Collector) SubscribeWithSnapshot() (State, <-chan Event, func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch, unsubscribe := c.subscribeLocked()
+	return c.snapshotLocked(), ch, unsubscribe
+}
+
+func (c *Collector) subscribeLocked() (<-chan Event, func()) {
 	ch := make(chan Event, 64)
 	c.subscribers[ch] = struct{}{}
-	return ch, func() { c.mu.Lock(); defer c.mu.Unlock(); delete(c.subscribers, ch); close(ch) }
+	return ch, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.subscribers, ch)
+		close(ch)
+	}
 }
+
 func (c *Collector) broadcast(t string, data any) {
 	for ch := range c.subscribers {
 		select {
@@ -150,22 +196,16 @@ func (c *Collector) Start(ctx context.Context) {
 		c.wg.Add(1)
 		go c.loop(ctx, path)
 	}
-	c.wg.Add(2)
+	c.wg.Add(3)
 	go c.flushLoop(ctx)
 	go c.scheduler(ctx)
+	go c.pruneLoop(ctx)
 }
 func (c *Collector) Stop() {
 	if c.cancel != nil {
 		c.cancel()
 		c.wg.Wait()
 	}
-	c.mu.Lock()
-	now := time.Now()
-	for _, v := range c.active {
-		c.closeConnection(v, now)
-	}
-	c.active = make(map[string]Connection)
-	c.mu.Unlock()
 	c.flush()
 }
 func (c *Collector) loop(ctx context.Context, path string) {
@@ -173,9 +213,11 @@ func (c *Collector) loop(ctx context.Context, path string) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		p := "/" + path
+		var persistLevel string
 		if path == "logs" {
+			persistLevel = c.Preferences().LogPersistLevel
 			level := "info"
-			if c.Preferences().LogPersistLevel == "debug" {
+			if persistLevel == "debug" {
 				level = "debug"
 			}
 			p += "?level=" + level
@@ -188,6 +230,11 @@ func (c *Collector) loop(ctx context.Context, path string) {
 			backoff = time.Second
 			if path == "logs" {
 				c.mu.Lock()
+				if c.prefs.LogPersistLevel != persistLevel {
+					c.mu.Unlock()
+					_ = conn.Close()
+					continue
+				}
 				c.logConn = conn
 				c.mu.Unlock()
 			}
@@ -218,6 +265,7 @@ func (c *Collector) loop(ctx context.Context, path string) {
 			_ = conn.Close()
 		}
 		if ctx.Err() != nil {
+			c.setStatus(path, false, nil)
 			return
 		}
 		c.setStatus(path, false, err)
@@ -234,30 +282,37 @@ func (c *Collector) loop(ctx context.Context, path string) {
 }
 func (c *Collector) setStatus(path string, connected bool, err error) {
 	c.mu.Lock()
-	c.connected[path] = connected
-	c.state.Status.Connected = false
-	for _, v := range c.connected {
-		if v {
-			c.state.Status.Connected = true
+	stream := StreamStatus{Connected: connected}
+	if err != nil {
+		stream.LastErr = err.Error()
+	}
+	// Status events keep their own stream map as later updates arrive.
+	streams := maps.Clone(c.state.Status.Streams)
+	streams[path] = stream
+	c.state.Status.Streams = streams
+	c.state.Status.Connected = streams["traffic"].Connected || streams["connections"].Connected
+	c.state.Status.LastErr = ""
+	for _, streamName := range []string{"traffic", "connections", "memory", "logs"} {
+		if message := streams[streamName].LastErr; message != "" {
+			c.state.Status.LastErr = message
+			break
 		}
 	}
-	if err != nil {
-		c.state.Status.LastErr = err.Error()
-	} else {
-		c.state.Status.LastErr = ""
+	if connected {
 		c.state.Status.LastSeenAt = time.Now().Unix()
 	}
+	coreConnected := c.state.Status.Connected
 	status := c.state.Status
 	c.broadcast("status", status)
 	c.mu.Unlock()
-	if connected {
+	if coreConnected {
 		c.once.Do(func() { c.initial <- struct{}{} })
 	}
 }
 func (c *Collector) consume(path string, raw json.RawMessage) {
+	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.state.Status.LastSeenAt = time.Now().Unix()
 	switch path {
 	case "traffic":
 		var v Traffic
@@ -272,40 +327,54 @@ func (c *Collector) consume(path string, raw json.RawMessage) {
 			c.broadcast(path, v)
 		}
 	case "connections":
-		var v ConnectionsSnapshot
-		if json.Unmarshal(raw, &v) == nil {
-			next := make(map[string]Connection)
-			for _, x := range v.Connections {
-				next[x.ID] = x
-			}
-			for id, x := range c.active {
-				if _, ok := next[id]; !ok {
-					c.closeConnection(x, time.Now())
-				}
-			}
-			c.active = next
-			c.state.Connections = v
-			c.totals = append(c.totals, ConnectionsSnapshot{UploadTotal: v.UploadTotal, DownloadTotal: v.DownloadTotal})
-			c.broadcast(path, v)
+		var frame struct {
+			DownloadTotal *int64          `json:"downloadTotal"`
+			UploadTotal   *int64          `json:"uploadTotal"`
+			Connections   json.RawMessage `json:"connections"`
 		}
+		if json.Unmarshal(raw, &frame) != nil || frame.DownloadTotal == nil || frame.UploadTotal == nil ||
+			*frame.DownloadTotal < 0 || *frame.UploadTotal < 0 || len(frame.Connections) == 0 {
+			return
+		}
+		var connections []Connection
+		if bytes.Equal(bytes.TrimSpace(frame.Connections), []byte("null")) {
+			connections = []Connection{}
+		} else if json.Unmarshal(frame.Connections, &connections) != nil {
+			return
+		}
+		v := ConnectionsSnapshot{DownloadTotal: *frame.DownloadTotal, UploadTotal: *frame.UploadTotal, Connections: connections}
+		next := make(map[string]Connection, len(v.Connections))
+		for _, x := range v.Connections {
+			next[x.ID] = x
+		}
+		for id, x := range c.active {
+			if _, ok := next[id]; !ok {
+				c.closeConnection(x, now)
+			}
+		}
+		c.active = next
+		c.state.Connections = v
+		c.totals = appendTrafficTotal(c.totals, database.TrafficTotal{Up: v.UploadTotal, Down: v.DownloadTotal, ObservedAt: now.Unix()})
+		c.broadcast(path, v)
 	case "logs":
 		var v struct {
 			Type    string `json:"type"`
 			Payload string `json:"payload"`
 		}
 		if json.Unmarshal(raw, &v) == nil {
-			entry := database.LogEntry{TS: time.Now().Unix(), Level: v.Type, Payload: v.Payload}
+			entry := database.LogEntry{TS: now.Unix(), Level: v.Type, Payload: v.Payload}
 			c.state.Logs = append(c.state.Logs, entry)
 			if len(c.state.Logs) > 200 {
 				c.state.Logs = c.state.Logs[len(c.state.Logs)-200:]
 			}
 			levels := map[string]int{"debug": 1, "info": 2, "warning": 3, "error": 4}
 			if threshold := levels[c.prefs.LogPersistLevel]; threshold > 0 && levels[v.Type] >= threshold {
-				c.logs = append(c.logs, entry)
+				c.logs = newest(append(c.logs, entry), maxPendingHistory)
 			}
 			c.broadcast("log", entry)
 		}
 	}
+	c.state.Status.LastSeenAt = now.Unix()
 }
 func (c *Collector) closeConnection(v Connection, now time.Time) {
 	start, err := time.Parse(time.RFC3339Nano, v.Start)
@@ -331,7 +400,7 @@ func (c *Collector) closeConnection(v Connection, now time.Time) {
 	if len(v.ProviderChains) > 0 {
 		x.ProviderName = v.ProviderChains[0]
 	}
-	c.closed = append(c.closed, x)
+	c.closed = newest(append(c.closed, x), maxPendingHistory)
 }
 func (c *Collector) flushLoop(ctx context.Context) {
 	defer c.wg.Done()
@@ -347,11 +416,14 @@ func (c *Collector) flushLoop(ctx context.Context) {
 	}
 }
 func (c *Collector) flush() {
+	if c.db == nil {
+		return
+	}
 	c.flushMu.Lock()
 	defer c.flushMu.Unlock()
 	now := time.Now()
 	c.mu.Lock()
-	closed, logs, pending := c.closed, c.logs, c.totals
+	closed, logs, totals := c.closed, c.logs, c.totals
 	c.closed, c.logs, c.totals = nil, nil, nil
 	connected := c.state.Status.Connected
 	sample := database.TrafficSample{TS: now.Unix(), UpBPS: c.state.Traffic.Up, DownBPS: c.state.Traffic.Down, MemInuse: c.state.Memory.Inuse, MemOslimit: c.state.Memory.Oslimit, ActiveConns: int64(len(c.active))}
@@ -360,15 +432,14 @@ func (c *Collector) flush() {
 	if connected {
 		samples = append(samples, sample)
 	}
-	totals := make([]database.TrafficTotal, 0, len(pending))
-	for _, total := range pending {
-		totals = append(totals, database.TrafficTotal{Up: total.UploadTotal, Down: total.DownloadTotal})
-	}
 	if len(samples) > 0 || len(totals) > 0 {
 		if err := database.RecordTrafficTotalsBatch(c.db, samples, totals, now); err != nil {
 			log.Printf("flush traffic: %v", err)
 			c.mu.Lock()
-			c.totals = append(pending, c.totals...)
+			for _, total := range c.totals {
+				totals = appendTrafficTotal(totals, total)
+			}
+			c.totals = totals
 			c.mu.Unlock()
 		} else if connected {
 			c.mu.Lock()
@@ -383,7 +454,7 @@ func (c *Collector) flush() {
 		if err := database.InsertClosedConnections(c.db, closed); err != nil {
 			log.Printf("flush connections: %v", err)
 			c.mu.Lock()
-			c.closed = append(closed, c.closed...)
+			c.closed = newest(append(closed, c.closed...), maxPendingHistory)
 			c.mu.Unlock()
 		}
 	}
@@ -391,7 +462,7 @@ func (c *Collector) flush() {
 		if err := database.InsertLogs(c.db, logs); err != nil {
 			log.Printf("flush logs: %v", err)
 			c.mu.Lock()
-			c.logs = append(logs, c.logs...)
+			c.logs = newest(append(logs, c.logs...), maxPendingHistory)
 			c.mu.Unlock()
 		}
 	}

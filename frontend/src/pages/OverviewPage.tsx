@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useReducer, useState } from 'react';
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api } from '../api/client';
 import type { OverviewResponse, TrafficPoint, ProxyItem, ProviderSnapshot } from '../types/api';
@@ -7,38 +7,58 @@ import { useLiveStore } from '../stores/useLiveStore';
 import { useToastStore } from '../stores/useToastStore';
 import { formatBytes, formatSpeed, formatRelative, formatUnixTime } from '../lib/format';
 import { Badge, Button, Card, EmptyState, Modal, Select, Tabs } from '../components/ui';
+import { useHistoryDialog } from '../hooks/useHistoryDialog';
 import ModeSwitcher from '../components/ModeSwitcher';
 export default function OverviewPage() {
   const [data, setData] = useState<OverviewResponse | null>(null);
   const [range, setRange] = useState('live');
   const [chart, setChart] = useState('network');
-  const [series, setSeries] = useState<TrafficPoint[]>([]);
+  const [series, setSeries] = useState<{ range: string; items: TrafficPoint[] } | null>(null);
   const [proxies, setProxies] = useState<Record<string, ProxyItem>>({});
-  const [history, setHistory] = useState<ProviderSnapshot[] | null>(null);
-  const [providerName, setProviderName] = useState('');
-  const prefs = usePrefsStore(s => s.prefs);
+  const [revision, load] = useReducer(n => n + 1, 0);
+  const { history, openHistory, closeHistory } = useHistoryDialog<ProviderSnapshot>();
+  const hiddenGroups = usePrefsStore(s => s.prefs?.hiddenGroups);
   const autoRefresh = usePrefsStore(s => s.prefs?.autoRefreshOverview);
-  const live = useLiveStore();
-  const toast = useToastStore();
-  const load = () => {
-    if (range !== 'live') void api.traffic(range).then(setSeries).catch(() => toast.error('加载流量历史失败'));
-    void api.overview().then(setData).catch(() => toast.error('加载概览失败'));
-    void api.proxies().then(x => setProxies(x.proxies)).catch(() => {});
-  };
+  const samples = useLiveStore(s => range === 'live' ? s.samples : null);
+  const traffic = useLiveStore(s => s.traffic);
+  const memory = useLiveStore(s => s.memory);
+  const connectionCount = useLiveStore(s => s.connections.length);
+  const status = useLiveStore(s => s.status);
+  const showSuccess = useToastStore(s => s.success);
+  const showError = useToastStore(s => s.error);
   useEffect(() => {
-    load();
     if (autoRefresh === false) return;
     const id = setInterval(load, 60000);
     return () => clearInterval(id);
-  }, [autoRefresh, range]);
-  const points = range === 'live' ? live.samples : series.map(p => ({
+  }, [autoRefresh]);
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+    void api.overview(signal).then(result => {
+      if (!signal.aborted) setData(result);
+    }).catch(() => {
+      if (!signal.aborted) showError('加载概览失败');
+    });
+    void api.proxies(signal).then(result => {
+      if (!signal.aborted) setProxies(result.proxies);
+    }).catch(() => {});
+    if (range !== 'live') {
+      void api.traffic(range, signal).then(items => {
+        if (!signal.aborted) setSeries({ range, items: items ?? [] });
+      }).catch(() => {
+        if (!signal.aborted) showError('加载流量历史失败');
+      });
+    }
+    return () => controller.abort();
+  }, [range, revision, showError]);
+  const points = range === 'live' ? (samples ?? []) : (series?.range === range ? series.items : []).map(p => ({
     ...p,
     upBps: p.upBps || p.peakUpBps,
     downBps: p.downBps || p.peakDownBps,
     memInuse: p.memInuse || p.avgMem
   }));
   const sum = data?.trafficSummary;
-  const groups = Object.values(proxies).filter(p => ['Selector', 'URLTest'].includes(p.type) && p.all?.length && !prefs?.hiddenGroups.includes(p.name) && (p.name !== 'GLOBAL' || data?.configs?.mode?.toLowerCase() === 'global')).sort((a, b) => Number(b.type === 'Selector') - Number(a.type === 'Selector'));
+  const groups = Object.values(proxies).filter(p => ['Selector', 'URLTest'].includes(p.type) && p.all?.length && !(hiddenGroups ?? []).includes(p.name) && (p.name !== 'GLOBAL' || data?.configs?.mode?.toLowerCase() === 'global')).sort((a, b) => Number(b.type === 'Selector') - Number(a.type === 'Selector'));
   const stats = data?.topStats;
   return <div className="space-y-6">
       <div>
@@ -47,10 +67,10 @@ export default function OverviewPage() {
       </div>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         {[
-          { label: '实时速率', value: formatSpeed(live.traffic.up + live.traffic.down), detail: `↑ ${formatSpeed(live.traffic.up)} · ↓ ${formatSpeed(live.traffic.down)}` },
-          { label: '内存占用', value: formatBytes(live.memory.inuse), detail: `上限 ${live.memory.oslimit ? formatBytes(live.memory.oslimit) : '不限'}` },
-          { label: '活跃连接数', value: String(live.connections.length) },
-          { label: '上游核心', value: live.status?.connected ? '已连接' : '离线', detail: live.status?.version || '版本未知' },
+          { label: '实时速率', value: formatSpeed(traffic.up + traffic.down), detail: `↑ ${formatSpeed(traffic.up)} · ↓ ${formatSpeed(traffic.down)}` },
+          { label: '内存占用', value: formatBytes(memory.inuse), detail: `上限 ${memory.oslimit ? formatBytes(memory.oslimit) : '不限'}` },
+          { label: '活跃连接数', value: String(connectionCount) },
+          { label: '上游核心', value: status?.connected ? '已连接' : '离线', detail: status?.version || '版本未知' },
           { label: '今日流量', value: formatBytes((sum?.todayUp || 0) + (sum?.todayDown || 0)), detail: `↑ ${formatBytes(sum?.todayUp || 0)} · ↓ ${formatBytes(sum?.todayDown || 0)}` },
           { label: '近 7 天流量', value: formatBytes((sum?.weekUp || 0) + (sum?.weekDown || 0)) },
           { label: '近 30 天流量', value: formatBytes((sum?.monthUp || 0) + (sum?.monthDown || 0)) },
@@ -109,13 +129,10 @@ export default function OverviewPage() {
       <div className="grid gap-4 lg:grid-cols-2">
         <Card className="p-4">
           <h2 className="mb-4 font-semibold">快速模式</h2>
-          <ModeSwitcher mode={data?.configs?.mode || 'rule'} onChange={mode => setData(d => d ? {
-          ...d,
-          configs: {
-            ...d.configs,
-            mode
-          }
-        } : d)} />
+          <ModeSwitcher mode={data?.configs?.mode || 'rule'} onChange={mode => {
+            setData(previous => previous?.configs ? { ...previous, configs: { ...previous.configs, mode } } : previous);
+            load();
+          }} />
         </Card>
         <Card className="p-4">
           <h2 className="mb-4 font-semibold">快速切换策略组</h2>
@@ -123,16 +140,16 @@ export default function OverviewPage() {
             <span className="w-28 truncate text-sm" title={g.name}>
               {g.name}
             </span>
-            <Select aria-label={`${g.name} 节点`} value={g.now || ''} onChange={e => void api.selectProxy(g.name, e.target.value).then(load).catch(() => toast.error('切换节点失败'))} className="min-w-0 flex-1">
+            <Select aria-label={`${g.name} 节点`} value={g.now || ''} onChange={e => void api.selectProxy(g.name, e.target.value).then(load).catch(() => showError('切换节点失败'))} className="min-w-0 flex-1">
               {g.all?.map(n => <option key={n}>
                 {n}
               </option>)}
             </Select>
-            {g.fixed && <><Badge>已固定</Badge><Button onClick={() => void api.unfixProxy(g.name).then(load).catch(() => toast.error('取消固定失败'))}>取消固定</Button></>}
+            {g.fixed && <><Badge>已固定</Badge><Button onClick={() => void api.unfixProxy(g.name).then(load).catch(() => showError('取消固定失败'))}>取消固定</Button></>}
             <Button onClick={() => void api.testGroup(g.name).then(() => {
-            toast.success('测速完成');
+            showSuccess('测速完成');
             load();
-          }).catch(() => toast.error('测速失败'))}>测速</Button>
+          }).catch(() => showError('测速失败'))}>测速</Button>
           </div>) : <EmptyState>暂无可用策略组</EmptyState>}
         </Card>
       </div>
@@ -144,16 +161,13 @@ export default function OverviewPage() {
           const used = s.Upload + s.Download;
           return <Card key={p.name} className="p-4">
             <div className="flex items-center justify-between gap-2">
-              <button className="truncate text-left font-medium hover:text-indigo-500" onClick={() => {
-                setProviderName(p.name);
-                void api.providerHistory(p.name).then(setHistory).catch(() => toast.error('加载订阅趋势失败'));
-              }}>
+              <button className="truncate text-left font-medium hover:text-indigo-500" onClick={() => openHistory(p.name, signal => api.providerHistory(p.name, signal), '加载订阅趋势失败')}>
                 {p.name}
               </button>
               <Button onClick={() => void api.updateProvider(p.name).then(() => {
-                toast.success('订阅已更新');
+                showSuccess('订阅已更新');
                 load();
-              }).catch(() => toast.error('更新订阅失败'))}>更新</Button>
+              }).catch(() => showError('更新订阅失败'))}>更新</Button>
             </div>
             <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
               <div className="h-full bg-indigo-500" style={{
@@ -173,7 +187,7 @@ export default function OverviewPage() {
       <div>
         <h2 className="mb-3 font-semibold">近 24 小时排行</h2>
         <div className="grid gap-3 md:grid-cols-3">
-          {([['Top 域名', stats?.topHosts], ['Top 节点', stats?.topProxies], ['Top 客户端 IP', stats?.topSrcIps]] as const).map(([title, items]) => <Card key={title} className="p-4">
+          {([['域名', stats?.topHosts], ['节点', stats?.topProxies], ['客户端 IP', stats?.topSrcIps]] as const).map(([title, items]) => <Card key={title} className="p-4">
             <h3 className="mb-3 text-sm font-medium">
               {title}
             </h3>
@@ -188,10 +202,10 @@ export default function OverviewPage() {
           </Card>)}
         </div>
       </div>
-      <Modal open={history !== null} onClose={() => setHistory(null)} title={`${providerName} · 订阅趋势`}>
+      <Modal open={history !== null} onClose={closeHistory} title={`${history?.name ?? ''} · 订阅趋势`}>
         <div className="h-56">
-          {history?.length ? <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={[...history].reverse()}>
+          {history?.items.length ? <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={[...history.items].reverse()}>
               <XAxis dataKey="capturedAt" tickFormatter={v => new Date(v * 1000).toLocaleDateString('zh-CN')} tick={{
               fontSize: 10
             }} />

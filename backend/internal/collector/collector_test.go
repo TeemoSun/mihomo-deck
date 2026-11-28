@@ -31,19 +31,19 @@ func TestCollectionResetConnectionsAndLogLevel(t *testing.T) {
 		c.consume(path, b)
 	}
 	send("connections", ConnectionsSnapshot{UploadTotal: 100, DownloadTotal: 200, Connections: []Connection{{ID: "one", Start: start, Metadata: Metadata{Host: "example.test"}, Chains: []string{"proxy"}}}})
-	send("connections", ConnectionsSnapshot{UploadTotal: 5, DownloadTotal: 10})
+	send("connections", ConnectionsSnapshot{UploadTotal: 5, DownloadTotal: 10, Connections: []Connection{}})
 	send("logs", map[string]string{"type": "info", "payload": "ignored"})
 	send("logs", map[string]string{"type": "error", "payload": "saved"})
 	c.flush()
-	summary, err := database.GetTrafficSummary(db, time.Now())
+	summary, err := database.GetTrafficSummary(context.Background(), db, time.Now())
 	if err != nil || summary.CumulativeUp != 105 || summary.CumulativeDown != 210 {
 		t.Fatalf("summary %+v: %v", summary, err)
 	}
-	connections, err := database.QueryConnections(db, database.ConnectionFilter{})
+	connections, err := database.QueryConnections(context.Background(), db, database.ConnectionFilter{})
 	if err != nil || len(connections.Items) != 1 || connections.Items[0].PrimaryProxy != "proxy" || connections.Items[0].DurationMS < 59000 {
 		t.Fatalf("connections %+v: %v", connections, err)
 	}
-	logs, err := database.QueryLogs(db, database.LogFilter{})
+	logs, err := database.QueryLogs(context.Background(), db, database.LogFilter{})
 	if err != nil || len(logs.Items) != 1 || logs.Items[0].Payload != "saved" {
 		t.Fatalf("logs %+v: %v", logs, err)
 	}
@@ -121,11 +121,11 @@ func TestSchedulerCapturePersistsProviderAndScheduledDelay(t *testing.T) {
 	if providers[0].ProviderName != "provider-a" || providers[0].UploadBytes != 11 || providers[0].AliveCount != 1 || providers[0].NodeCount != 2 {
 		t.Fatalf("provider snapshot %+v", providers[0])
 	}
-	delays, err := database.QueryDelays(db, "node-a", time.Unix(0, 0), 10)
+	delays, err := database.QueryDelays(db, "node-a", "", time.Unix(0, 0), 10)
 	if err != nil || len(delays) != 1 {
 		t.Fatalf("delays %+v %v", delays, err)
 	}
-	if delays[0].DelayMS != 123 || delays[0].Source != "scheduled" || delays[0].GroupName != "group-a" || !delays[0].OK {
+	if delays[0].ProviderName != "actual-sub" || delays[0].DelayMS != 123 || delays[0].Source != "scheduled" || delays[0].GroupName != "group-a" || !delays[0].OK {
 		t.Fatalf("scheduled delay %+v", delays[0])
 	}
 	if c.Snapshot().Status.Version != "test-version" {
@@ -180,7 +180,7 @@ func TestFlushDisconnectedAndRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := New(db, nil, database.DefaultPreferences(30, 30, "info"))
-	c.totals = []ConnectionsSnapshot{{UploadTotal: 12}}
+	c.totals = []database.TrafficTotal{{Up: 12}}
 	c.logs = []database.LogEntry{{TS: time.Now().Unix(), Level: "error", Payload: "retry"}}
 	c.closed = []database.ClosedConnection{{ID: "retry"}}
 	if _, err = db.Exec(`CREATE TRIGGER reject_total BEFORE INSERT ON traffic_cursor BEGIN SELECT RAISE(ABORT, 'rejected'); END`); err != nil {
@@ -194,7 +194,7 @@ func TestFlushDisconnectedAndRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.flush()
-	summary, err := database.GetTrafficSummary(db, time.Now())
+	summary, err := database.GetTrafficSummary(context.Background(), db, time.Now())
 	if err != nil || summary.CumulativeUp != 12 || len(c.totals) != 0 {
 		t.Fatalf("summary %+v: %v", summary, err)
 	}
@@ -206,5 +206,131 @@ func TestFlushDisconnectedAndRetry(t *testing.T) {
 	c.flush()
 	if len(c.Snapshot().TrafficHistory) != 1 {
 		t.Fatal("connected sample missing")
+	}
+}
+
+func TestInvalidConnectionsFramesKeepLastValidSnapshot(t *testing.T) {
+	c := New(nil, nil, database.DefaultPreferences(30, 30, "info"))
+	c.consume("connections", json.RawMessage(`{"downloadTotal":20,"uploadTotal":10,"connections":[{"id":"active"}]}`))
+	for _, frame := range []string{
+		`null`,
+		`{"downloadTotal":null,"uploadTotal":0,"connections":[]}`,
+		`{"downloadTotal":0,"connections":[]}`,
+		`{"downloadTotal":-1,"uploadTotal":0,"connections":[]}`,
+		`{"downloadTotal":0,"uploadTotal":-1,"connections":[]}`,
+		`{"downloadTotal":0,"uploadTotal":0}`,
+		`{"downloadTotal":0,"uploadTotal":0,"connections":{}}`,
+		`{"downloadTotal":0,"uploadTotal":0,"connections":"bad"}`,
+	} {
+		c.consume("connections", json.RawMessage(frame))
+		if len(c.active) != 1 || c.active["active"].ID != "active" || len(c.totals) != 1 || len(c.closed) != 0 {
+			t.Fatalf("invalid frame mutated state: %s", frame)
+		}
+	}
+	if total := c.totals[0]; total.Up != 10 || total.Down != 20 || total.ObservedAt == 0 {
+		t.Fatalf("valid frame totals %+v", total)
+	}
+}
+
+func TestNullConnectionsFrameClosesActiveConnection(t *testing.T) {
+	c := New(nil, nil, database.DefaultPreferences(30, 30, "info"))
+	c.consume("connections", json.RawMessage(`{"downloadTotal":20,"uploadTotal":10,"connections":[{"id":"active","upload":10,"download":20}]}`))
+	c.consume("connections", json.RawMessage(`{"downloadTotal":25,"uploadTotal":15,"connections":null}`))
+
+	if len(c.active) != 0 {
+		t.Fatalf("active connections after empty snapshot: %+v", c.active)
+	}
+	snapshot := c.Snapshot().Connections
+	if snapshot.Connections == nil || len(snapshot.Connections) != 0 || snapshot.UploadTotal != 15 || snapshot.DownloadTotal != 25 {
+		t.Fatalf("empty snapshot: %+v", snapshot)
+	}
+	if len(c.closed) != 1 {
+		t.Fatalf("expected one closed connection, got %+v", c.closed)
+	}
+	if closed := c.closed[0]; closed.ID != "active" || closed.UploadBytes != 10 || closed.DownloadBytes != 20 || closed.ClosedAt == 0 {
+		t.Fatalf("closed connection: %+v", closed)
+	}
+	if len(c.totals) != 2 {
+		t.Fatalf("expected both traffic totals, got %+v", c.totals)
+	}
+	if total := c.totals[1]; total.Up != 15 || total.Down != 25 || total.ObservedAt == 0 {
+		t.Fatalf("closing frame totals: %+v", total)
+	}
+}
+
+func TestClearHistoryDiscardsPendingBuffers(t *testing.T) {
+	db, err := database.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	c := New(db, nil, database.DefaultPreferences(30, 30, "info"))
+	if err := database.InsertClosedConnections(db, []database.ClosedConnection{{ID: "stored"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.InsertLogs(db, []database.LogEntry{{Payload: "stored"}}); err != nil {
+		t.Fatal(err)
+	}
+	c.consume("connections", json.RawMessage("{\"downloadTotal\":20,\"uploadTotal\":10,\"connections\":[{\"id\":\"closed\"},{\"id\":\"active\"}]}"))
+	c.consume("connections", json.RawMessage("{\"downloadTotal\":22,\"uploadTotal\":12,\"connections\":[{\"id\":\"active\"}]}"))
+	c.consume("logs", json.RawMessage("{\"type\":\"error\",\"payload\":\"pending\"}"))
+	if len(c.closed) != 1 || len(c.logs) != 1 {
+		t.Fatal("test did not queue both kinds of history")
+	}
+	if err := c.ClearConnections(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ClearLogs(db); err != nil {
+		t.Fatal(err)
+	}
+	c.consume("logs", json.RawMessage("{\"type\":\"error\",\"payload\":\"after clear\"}"))
+	c.Stop()
+
+	conns, err := database.QueryConnections(context.Background(), db, database.ConnectionFilter{})
+	if err != nil || conns.Total != 0 {
+		t.Fatalf("cleared or active connections were persisted: %+v, %v", conns, err)
+	}
+	logs, err := database.QueryLogs(context.Background(), db, database.LogFilter{})
+	if err != nil || len(logs.Items) != 1 || logs.Items[0].Payload != "after clear" {
+		t.Fatalf("logs after final flush: %+v, %v", logs, err)
+	}
+	summary, err := database.GetTrafficSummary(context.Background(), db, time.Now())
+	if err != nil || summary.CumulativeUp != 12 {
+		t.Fatalf("final traffic flush: %+v, %v", summary, err)
+	}
+}
+
+func TestPendingTotalsCoalesceWithinHourWithoutHidingReset(t *testing.T) {
+	totals := make([]database.TrafficTotal, 0, maxPendingTotals)
+	for i := int64(1); i <= maxPendingTotals; i++ {
+		totals = appendTrafficTotal(totals, database.TrafficTotal{Up: i, Down: i, ObservedAt: 3600})
+	}
+	totals = appendTrafficTotal(totals, database.TrafficTotal{Up: 1, Down: 1, ObservedAt: 7200})
+	totals = appendTrafficTotal(totals, database.TrafficTotal{Up: maxPendingTotals + 1, Down: maxPendingTotals + 1, ObservedAt: 7200})
+	if len(totals) != maxPendingTotals {
+		t.Fatalf("buffer grew to %d", len(totals))
+	}
+	for i, want := range []int64{maxPendingTotals, 1, maxPendingTotals + 1} {
+		if got := totals[len(totals)-3+i].Up; got != want {
+			t.Fatalf("reset sequence index %d: got %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestDisabledSchedulerStillFetchesVersion(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/version" {
+			t.Errorf("disabled scheduler requested %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte("{\"version\":\"test-version\"}"))
+	}))
+	defer upstream.Close()
+	c := New(nil, mihomo.NewClient(upstream.URL, ""), database.DefaultPreferences(30, 0, "info"))
+	c.capture(context.Background())
+	if status := c.Status(); status.Version != "test-version" {
+		t.Fatalf("status %+v", status)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -47,7 +49,7 @@ func TestAuthAndProxy(t *testing.T) {
 	c := collector.New(db, client, database.DefaultPreferences(30, 30, "info"))
 	h := api.NewRouter(db, cfg, client, c)
 	login := httptest.NewRecorder()
-	h.ServeHTTP(login, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
+	h.ServeHTTP(login, jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
 	if login.Code != 200 {
 		t.Fatalf("login: %d %s", login.Code, login.Body.String())
 	}
@@ -76,16 +78,16 @@ func TestAuthAndProxy(t *testing.T) {
 	if got := request("DELETE", "/api/telemetry/logs", true).Code; got != 204 {
 		t.Fatalf("delete status %d", got)
 	}
-	rec := request("GET", "/api/mihomo/proxies/"+url.PathEscape("节点 😀")+"/delay", false)
+	rec := request("POST", "/api/mihomo/proxies/"+url.PathEscape("节点 😀")+"/delay", true)
 	if rec.Code != 200 {
 		t.Fatalf("delay: %d %s", rec.Code, rec.Body.String())
 	}
-	records, err := database.QueryDelays(db, "", time.Unix(0, 0), 10)
+	records, err := database.QueryDelays(db, "", "", time.Unix(0, 0), 10)
 	if err != nil || len(records) != 1 || records[0].ProxyName != "节点 😀" {
 		t.Fatalf("delays: %+v %v", records, err)
 	}
 	for _, name := range []string{"HK/01 😀", "100%"} {
-		rec := request("GET", "/api/mihomo/proxies/"+url.PathEscape(name)+"/delay", false)
+		rec := request("POST", "/api/mihomo/proxies/"+url.PathEscape(name)+"/delay", true)
 		if rec.Code != 200 {
 			t.Fatalf("delay %q: %d %s", name, rec.Code, rec.Body.String())
 		}
@@ -142,20 +144,25 @@ func TestLoginRateLimitAndTrustedProxyIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := mihomo.NewClient(upstream.URL, "")
-	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret", TrustProxy: true}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
+	_, trusted, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret", TrustProxy: true, TrustedProxyNets: []*net.IPNet{trusted}}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
 	login := func(xff string) int {
-		req := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
+		req := jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"bad-password"}`))
+		req.RemoteAddr = "10.0.0.1:1234"
 		req.Header.Set("X-Forwarded-For", xff)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec.Code
 	}
 	for i := 0; i < 5; i++ {
-		if got := login("198.51.100." + string(rune('1'+i)) + ", 203.0.113.7"); got != 401 {
+		if got := login("198.51.100." + string(rune('1'+i)) + ", 203.0.113.7, 10.1.2.3"); got != 401 {
 			t.Fatalf("attempt %d status %d", i+1, got)
 		}
 	}
-	if got := login("203.0.113.99, 203.0.113.7"); got != 429 {
+	if got := login("203.0.113.99, 203.0.113.7, 10.1.2.3"); got != 429 {
 		t.Fatalf("rotated left XFF status %d", got)
 	}
 }
@@ -178,7 +185,7 @@ func TestPasswordChangePersistsAndRotatesSessions(t *testing.T) {
 	c := collector.New(db, client, database.DefaultPreferences(30, 30, "info"))
 	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, c)
 	loginReq := func(password string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"`+password+`"}`))
+		req := jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"`+password+`"}`))
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec
@@ -192,7 +199,7 @@ func TestPasswordChangePersistsAndRotatesSessions(t *testing.T) {
 	}
 	_ = json.Unmarshal(login.Body.Bytes(), &payload)
 	oldCookies := login.Result().Cookies()
-	change := httptest.NewRequest("POST", "/api/auth/password", strings.NewReader(`{"currentPassword":"good-password","newPassword":"new-good-password"}`))
+	change := jsonRequest("POST", "/api/auth/password", strings.NewReader(`{"currentPassword":"good-password","newPassword":"new-good-password"}`))
 	for _, cookie := range oldCookies {
 		change.AddCookie(cookie)
 	}
@@ -253,7 +260,7 @@ func TestPasswordChangePersistsAndRotatesSessions(t *testing.T) {
 	newClient := mihomo.NewClient(upstream.URL, "")
 	newHandler := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, newClient, collector.New(db, newClient, database.DefaultPreferences(30, 30, "info")))
 	after := httptest.NewRecorder()
-	newHandler.ServeHTTP(after, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"new-good-password"}`)))
+	newHandler.ServeHTTP(after, jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"new-good-password"}`)))
 	if after.Code != 200 {
 		t.Fatalf("new password did not authenticate after reopening database: %d", after.Code)
 	}
@@ -275,7 +282,7 @@ func TestPreferencesPersistenceAndBounds(t *testing.T) {
 	c := collector.New(db, client, database.DefaultPreferences(30, 30, "info"))
 	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, c)
 	login := httptest.NewRecorder()
-	h.ServeHTTP(login, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
+	h.ServeHTTP(login, jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
 	var x struct {
 		CSRF string `json:"csrfToken"`
 	}
@@ -330,7 +337,7 @@ func TestOverviewUpstreamTimeoutFallback(t *testing.T) {
 	client := mihomo.NewClient(up.URL, "")
 	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
 	login := httptest.NewRecorder()
-	h.ServeHTTP(login, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
+	h.ServeHTTP(login, jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
 	var x struct {
 		CSRF string `json:"csrfToken"`
 	}
@@ -370,12 +377,13 @@ func TestProxyPreservesUpstream504(t *testing.T) {
 	client := mihomo.NewClient(up.URL, "")
 	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
 	login := httptest.NewRecorder()
-	h.ServeHTTP(login, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
+	h.ServeHTTP(login, jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
 	var x struct {
 		CSRF string `json:"csrfToken"`
 	}
 	_ = json.Unmarshal(login.Body.Bytes(), &x)
-	r := httptest.NewRequest("GET", "/api/mihomo/proxies/node/delay", nil)
+	r := httptest.NewRequest("POST", "/api/mihomo/proxies/node/delay", nil)
+	r.Header.Set("X-CSRF-Token", x.CSRF)
 	for _, cookie := range login.Result().Cookies() {
 		r.AddCookie(cookie)
 	}
@@ -507,17 +515,19 @@ func TestProviderProxyDelay(t *testing.T) {
 	client := mihomo.NewClient(up.URL, "")
 	h := api.NewRouter(db, config.Config{JWTSecret: "a-strong-test-secret"}, client, collector.New(db, client, database.DefaultPreferences(30, 30, "info")))
 	login := httptest.NewRecorder()
-	h.ServeHTTP(login, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
+	h.ServeHTTP(login, jsonRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"admin","password":"good-password"}`)))
 	if login.Code != http.StatusOK {
 		t.Fatalf("login: %d", login.Code)
 	}
+	csrf := loginCSRF(t, login)
 	for _, provider := range []string{"sub", ""} {
 		paths = nil
 		query := url.Values{"url": {"https://example.test/check?a=1"}, "timeout": {"1234"}}
 		if provider != "" {
 			query.Set("provider", provider)
 		}
-		req := httptest.NewRequest("GET", "/api/mihomo/proxies/node/delay?"+query.Encode(), nil)
+		req := httptest.NewRequest("POST", "/api/mihomo/proxies/node/delay?"+query.Encode(), nil)
+		req.Header.Set("X-CSRF-Token", csrf)
 		for _, cookie := range login.Result().Cookies() {
 			req.AddCookie(cookie)
 		}
@@ -534,13 +544,30 @@ func TestProviderProxyDelay(t *testing.T) {
 			t.Fatalf("provider %q: paths %s", provider, got)
 		}
 	}
-	records, err := database.QueryDelays(db, "node", time.Unix(0, 0), 10)
+	records, err := database.QueryDelays(db, "node", "", time.Unix(0, 0), 10)
 	if err != nil || len(records) != 2 {
 		t.Fatalf("delay records: %+v %v", records, err)
 	}
 	for _, record := range records {
-		if record.DelayMS != 42 || !record.OK || record.Source != "manual" || record.TestURL != "https://example.test/check?a=1" {
+		if record.ProviderName != "sub" || record.DelayMS != 42 || !record.OK || record.Source != "manual" || record.TestURL != "https://example.test/check?a=1" {
 			t.Errorf("delay record: %+v", record)
 		}
 	}
+}
+
+func jsonRequest(method, path string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, path, body)
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func loginCSRF(t *testing.T, login *httptest.ResponseRecorder) string {
+	t.Helper()
+	var payload struct {
+		CSRF string `json:"csrfToken"`
+	}
+	if login.Code != http.StatusOK || json.Unmarshal(login.Body.Bytes(), &payload) != nil || payload.CSRF == "" {
+		t.Fatalf("login: %d %s", login.Code, login.Body.String())
+	}
+	return payload.CSRF
 }

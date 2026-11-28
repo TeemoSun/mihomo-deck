@@ -25,20 +25,30 @@ type Preferences struct {
 func DefaultPreferences(retention, interval int, level string) Preferences {
 	return Preferences{Theme: "system", RetentionDays: retention, SnapshotIntervalMin: interval, LogPersistLevel: level, HideInfoNodes: true, InfoNodePattern: "剩余流量|距离下次|套餐到期|官网|重置|到期|Traffic|Expire|Website", PinnedProxies: []string{}, HiddenGroups: []string{}, ProxySort: "default", DelayTestURL: "https://www.gstatic.com/generate_204", DelayTestTimeout: 5000, AutoRefreshOverview: true, DefaultConnectionsTab: "active"}
 }
+func (p Preferences) Normalized() Preferences {
+	if p.PinnedProxies == nil {
+		p.PinnedProxies = []string{}
+	}
+	if p.HiddenGroups == nil {
+		p.HiddenGroups = []string{}
+	}
+	return p
+}
+
 func GetPreferences(db *sql.DB, defaults Preferences) (Preferences, error) {
 	var data string
 	err := db.QueryRow("SELECT value_json FROM user_preferences WHERE key='preferences'").Scan(&data)
 	if err == sql.ErrNoRows {
-		return defaults, nil
+		return defaults.Normalized(), nil
 	}
 	if err != nil {
-		return defaults, err
+		return defaults.Normalized(), err
 	}
 	err = json.Unmarshal([]byte(data), &defaults)
-	return defaults, err
+	return defaults.Normalized(), err
 }
 func UpdatePreferences(db *sql.DB, p Preferences) error {
-	b, err := json.Marshal(p)
+	b, err := json.Marshal(p.Normalized())
 	if err != nil {
 		return err
 	}

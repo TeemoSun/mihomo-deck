@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"github.com/TeemoSun/mihomo-deck/internal/database"
 	"net/http"
+	"sync"
 	"time"
+
+	"github.com/TeemoSun/mihomo-deck/internal/database"
 )
 
 func result(w http.ResponseWriter, v any, err error) {
@@ -19,11 +21,20 @@ func (s *Server) getPreferences(w http.ResponseWriter, r *http.Request) {
 	write(w, s.collector.Preferences())
 }
 func (s *Server) putPreferences(w http.ResponseWriter, r *http.Request) {
-	p := s.collector.Preferences()
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&p) != nil || p.RetentionDays < 1 || p.RetentionDays > 3650 || p.SnapshotIntervalMin < 0 || p.SnapshotIntervalMin > 10080 || p.DelayTestTimeout < 100 || p.DelayTestTimeout > 60000 || (p.LogPersistLevel != "silent" && p.LogPersistLevel != "error" && p.LogPersistLevel != "warning" && p.LogPersistLevel != "info" && p.LogPersistLevel != "debug") || (p.Theme != "system" && p.Theme != "light" && p.Theme != "dark") {
+	body := http.MaxBytesReader(w, r.Body, 65536)
+	var patch json.RawMessage
+	if json.NewDecoder(body).Decode(&patch) != nil {
 		fail(w, 400)
 		return
 	}
+	s.prefsMu.Lock()
+	defer s.prefsMu.Unlock()
+	p := s.collector.Preferences()
+	if json.Unmarshal(patch, &p) != nil || p.RetentionDays < 1 || p.RetentionDays > 3650 || p.SnapshotIntervalMin < 0 || p.SnapshotIntervalMin > 10080 || p.DelayTestTimeout < 100 || p.DelayTestTimeout > 60000 || (p.LogPersistLevel != "silent" && p.LogPersistLevel != "error" && p.LogPersistLevel != "warning" && p.LogPersistLevel != "info" && p.LogPersistLevel != "debug") || (p.Theme != "system" && p.Theme != "light" && p.Theme != "dark") {
+		fail(w, 400)
+		return
+	}
+	p = p.Normalized()
 	if database.UpdatePreferences(s.db, p) != nil {
 		fail(w, 500)
 		return
@@ -33,7 +44,7 @@ func (s *Server) putPreferences(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	state := s.collector.Snapshot()
-	summary, err := database.GetTrafficSummary(s.db, time.Now())
+	summary, err := database.GetTrafficSummary(r.Context(), s.db, time.Now())
 	if err != nil {
 		fail(w, 500)
 		return
@@ -50,8 +61,18 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	}
 	upstreamCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	configs, _ := s.client.Configs(upstreamCtx)
-	providers, _ := s.client.ProxyProviders(upstreamCtx)
+	var configs, providers json.RawMessage
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		configs, _ = s.client.Configs(upstreamCtx)
+	}()
+	go func() {
+		defer wg.Done()
+		providers, _ = s.client.ProxyProviders(upstreamCtx)
+	}()
+	wg.Wait()
 	write(w, map[string]any{"status": state.Status, "traffic": state.Traffic, "memory": state.Memory, "trafficSummary": summary, "trafficSeries": series, "topStats": top, "configs": rawOrNull(configs), "providers": rawOrNull(providers)})
 }
 func rawOrNull(raw json.RawMessage) json.RawMessage {
@@ -74,11 +95,11 @@ func (s *Server) traffic(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) connections(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	v, e := database.QueryConnections(s.db, database.ConnectionFilter{Q: q.Get("q"), Host: q.Get("host"), Proxy: q.Get("proxy"), SrcIP: q.Get("srcIp"), Rule: q.Get("rule"), From: int64(num(r, "from", 0)), To: int64(num(r, "to", 0)), Page: num(r, "page", 1), PageSize: num(r, "pageSize", 50)})
+	v, e := database.QueryConnections(r.Context(), s.db, database.ConnectionFilter{Q: q.Get("q"), Host: q.Get("host"), Proxy: q.Get("proxy"), SrcIP: q.Get("srcIp"), Rule: q.Get("rule"), From: int64(num(r, "from", 0)), To: int64(num(r, "to", 0)), Page: num(r, "page", 1), PageSize: num(r, "pageSize", 50)})
 	result(w, v, e)
 }
 func (s *Server) clearConnections(w http.ResponseWriter, r *http.Request) {
-	if database.ClearConnectionHistory(s.db) != nil {
+	if s.collector.ClearConnections(s.db) != nil {
 		fail(w, 500)
 		return
 	}
@@ -86,18 +107,18 @@ func (s *Server) clearConnections(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	v, e := database.QueryLogs(s.db, database.LogFilter{Level: q.Get("level"), Q: q.Get("q"), From: int64(num(r, "from", 0)), To: int64(num(r, "to", 0)), Page: num(r, "page", 1), PageSize: num(r, "pageSize", 50)})
+	v, e := database.QueryLogs(r.Context(), s.db, database.LogFilter{Level: q.Get("level"), Q: q.Get("q"), From: int64(num(r, "from", 0)), To: int64(num(r, "to", 0)), Page: num(r, "page", 1), PageSize: num(r, "pageSize", 50)})
 	result(w, v, e)
 }
 func (s *Server) clearLogs(w http.ResponseWriter, r *http.Request) {
-	if database.ClearLogs(s.db) != nil {
+	if s.collector.ClearLogs(s.db) != nil {
 		fail(w, 500)
 		return
 	}
 	w.WriteHeader(204)
 }
 func (s *Server) delays(w http.ResponseWriter, r *http.Request) {
-	v, e := database.QueryDelays(s.db, r.URL.Query().Get("proxyName"), time.Unix(int64(num(r, "from", 0)), 0), num(r, "limit", 200))
+	v, e := database.QueryDelays(s.db, r.URL.Query().Get("proxyName"), r.URL.Query().Get("providerName"), time.Unix(int64(num(r, "from", 0)), 0), num(r, "limit", 200))
 	result(w, v, e)
 }
 func (s *Server) providers(w http.ResponseWriter, r *http.Request) {

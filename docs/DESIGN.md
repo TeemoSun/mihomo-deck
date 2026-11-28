@@ -5,9 +5,9 @@
 **Mihomo Deck** 是面向 Mihomo（原 Clash Meta）的现代化自托管 Web 控制台，采用 **React 19 + Go + SQLite** 单容器架构。
 相比 `metacubexd` 等纯静态前端直连 `9090` 端口的方案，Mihomo Deck 引入 Go 后端作为 BFF（Backend for Frontend）与持久化采集引擎，解决以下痛点：
 1. **认证保护**：提供完整的账号密码登录、HttpOnly Cookie 双 Token 鉴权、CSRF 防护与防爆破限流，浏览器侧永不暴露 Mihomo `secret`。
-2. **固定后端，开箱即用**：前端彻底移除多后端配置弹窗，由服务端通过 Compose 环境变量直连单一 Mihomo 管理接口（默认示例指向 `http://192.168.5.2:9090`）。
+2. **单一 Mihomo 上游**由服务端环境变量配置。示例 Compose 默认连接同一网络内的 `http://mihomo:9090`。
 3. **跨重启与跨设备持久化**：Mihomo 重启或浏览器刷新不会丢失流量曲线、累计流量、已关闭连接记录、运行日志、节点测速历史、订阅余量快照与个人界面偏好。
-4. **全量能力覆盖与安全护栏**：覆盖节点切换、测速、策略/规则提供者更新、规则命中统计、连接审计与断开、内核参数修改、DNS 诊断、缓存清理、Geo 更新、内核重启，并对高危操作提供二次确认弹窗。
+4. **Mihomo 控制与高危操作确认**涵盖节点切换、测速、策略/规则提供者更新、规则命中统计、连接审计与断开、内核参数修改、DNS 诊断、缓存清理、Geo 更新与内核重启。
 5. **桌面与移动端同等流畅**：极简高信息密度专业控制台风格（Linear / Cloudflare 风格，浅色/深色主题），纯简体中文，桌面侧边栏 + 移动端底部导航/抽屉适配。
 
 ---
@@ -34,9 +34,9 @@
 
 ### 核心模块划分
 - `backend/cmd/server/main.go`：配置加载、密钥校验、SQLite 初始化、Mihomo 客户端与采集器启动、HTTP/WS 服务与优雅停机、`-healthcheck` 探针。
-- `backend/internal/config`：环境变量读取、默认配置与安全校验（`AUTH_PASSWORD`、`JWT_SECRET` 禁止空值或占位弱密码；`MIHOMO_SECRET` 允许任意配置值含空或简短内网密码）。
+- `backend/internal/config` 负责读取环境变量与校验启动配置。`AUTH_PASSWORD` 在 `users` 表为空时校验，`JWT_SECRET` 每次启动均校验，`MIHOMO_SECRET` 可以为空。
 - `backend/internal/database`：基于 `modernc.org/sqlite` 的纯 Go SQLite 层（`CGO_ENABLED=0`），开启 WAL、外键约束、`busy_timeout=5000`、`MaxOpenConns(1)`。
-- `backend/internal/mihomo`：封装 Mihomo v1.19.x 全量 REST API 与 WebSocket 流连接器。
+- `backend/internal/mihomo` 封装控制与采集所需的 Mihomo REST 请求和 WebSocket 流。
 - `backend/internal/collector`：常驻后台采集引擎，负责断线指数退避重连、连接关闭 diff 落盘、跨重启流量差值累加、小时级聚合、低频订阅/节点快照与 30 天（可配）过期数据自动清理。
 - `backend/internal/api`：Chi v5 路由、鉴权中间件、滑动窗口登录限流、CSRF 校验、安全响应头（CSP/nosniff/X-Frame-Options）、WebSocket 实时分发 Hub。
 - `frontend/`：React 19 + TypeScript + Vite + Tailwind CSS v4 + Zustand + Recharts + Lucide Icons。
@@ -76,16 +76,47 @@
 
 ## 4. 鉴权与安全设计
 
-- **登录态**：`POST /api/auth/login` 校验 bcrypt 密码后下发：
+- **登录态**。`POST /api/auth/login` 校验 bcrypt 密码后下发以下 Cookie，并在响应体返回 `csrfToken`。
   - `deck_access` Cookie（HttpOnly, SameSite=Lax, Path=/, 15 分钟）
   - `deck_refresh` Cookie（HttpOnly, SameSite=Lax, Path=/api/auth, 30 天）
-  - 响应体返回 CSRF Token（由 `JWT_SECRET` 对当前会话派生 HMAC-SHA256，前端内存/Zustand 保存并在所有变更请求附带 `X-CSRF-Token` 头）。
-- **HTTP / HTTPS 兼容**：
-  - 默认 `COOKIE_SECURE=false`，开箱适配局域网 `http://192.168.5.2:<port>` 访问。
-  - 若部署在 HTTPS 反向代理后，可通过 `TRUST_PROXY=true` 与 `COOKIE_SECURE=true`（或 `auto`，根据 `X-Forwarded-Proto: https` 动态开启 `Secure`）。
-- **防爆破与安全头**：
-  - 同一 IP 5 分钟内连续失败 5 次触发 `429` 限流。
+- **密码校验**。初始化和设置新密码时，密码须为 8–72 个 UTF-8 字节，且避开弱占位值。登录和改密时提交的当前密码也检查此字节长度。
+- **CSRF**。`csrfToken` 由 `JWT_SECRET` 对用户 ID 与 `token_version` 做 HMAC-SHA256 派生。鉴权后的 `POST`、`PUT`、`PATCH`、`DELETE` 请求须发送 `X-CSRF-Token`，校验失败返回 `403`。这包括节点测速、策略组测速和代理提供者健康检查。`POST /api/auth/login`、`POST /api/auth/refresh` 和 `POST /api/auth/logout` 在提供 `Origin` 时校验其主机与端口是否匹配请求的 `Host`。
+- **认证失败标记**。Deck 的认证失败返回 `401`，附带 `X-Deck-Auth-Error: 1`。转发的 Mihomo `401` 保留状态码，前端根据响应头识别 Deck 的认证失败。
+- **HTTP / HTTPS 兼容**。
+  - `COOKIE_SECURE=false` 支持局域网 HTTP。`true` 始终启用 `Secure`，`auto` 在直接 TLS 连接或可信代理发送 `X-Forwarded-Proto: https` 时启用 `Secure`。
+  - `TRUST_PROXY=true` 时，Deck 仅对来源 IP 命中 `TRUSTED_PROXIES` 的直接连接采用代理头。客户端 IP 优先取 `X-Forwarded-For` 中从右往左第一个不可信的地址。若链中地址均可信，取最左侧地址。`X-Forwarded-For` 为空时尝试 `X-Real-IP`。
+- **防爆破与安全头**。
+  - 同一 IP 在 5 分钟内累计 5 次登录失败后，后续尝试返回 `429`。同一 IP 等待校验的请求也占用窗口配额，成功登录会清除该 IP 的失败记录。
   - 全局注入 `Content-Security-Policy`（`script-src 'self'`，主题初始化脚本外置在 `public/theme-init.js`）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`。
+
+### Mihomo API 子集
+
+Deck 在 `/api/mihomo` 下公开以下 REST 路由，均要求 Deck 登录。表中的路径相对于 `/api/mihomo`。
+
+| 方法 | 路径 |
+| --- | --- |
+| `GET` | `/version` |
+| `GET`, `PATCH` | `/configs` |
+| `PUT` | `/configs/reload` |
+| `POST` | `/configs/geo` |
+| `POST` | `/restart` |
+| `GET` | `/proxies` |
+| `PUT`, `DELETE` | `/proxies/{name}` |
+| `POST` | `/proxies/{name}/delay` |
+| `POST` | `/group/{name}/delay` |
+| `GET` | `/providers/proxies` |
+| `PUT` | `/providers/proxies/{name}` |
+| `POST` | `/providers/proxies/{name}/healthcheck` |
+| `GET` | `/providers/rules` |
+| `PUT` | `/providers/rules/{name}` |
+| `GET` | `/rules` |
+| `GET`, `DELETE` | `/connections` |
+| `DELETE` | `/connections/{id}` |
+| `GET` | `/dns/query` |
+| `POST` | `/cache/fakeip/flush` |
+| `POST` | `/cache/dns/flush` |
+
+Deck 收到测速和代理提供者健康检查的 `POST` 后，向 Mihomo 发起相应的 `GET`。浏览器从 Deck 的鉴权 WebSocket `GET /api/ws/live` 获取实时数据。容器探针 `-healthcheck` 在本机请求无需登录的 `GET /api/health`，以 HTTP `200` 判定探测成功。该接口在数据库不可用时返回 `503`，成功响应的 `upstream` 字段报告采集器连接状态。
 
 ---
 
@@ -117,6 +148,25 @@
 
 ## 7. 安全测试隔离原则
 
-- 严禁在测试中修改 `192.168.5.2` 上的生产代理或提交任何真实订阅链接、密码与内网私有密钥到仓库。
+- 测试仅使用本地模拟服务或隔离容器，禁止连接 `192.168.5.2` 上的生产代理。仓库禁止提交真实订阅链接、密码与内网私有密钥。
 - 单元测试使用内置 Mock Mihomo HTTP+WS 服务与临时 SQLite。
 - 集成测试在本地单独启动隔离的 `metacubex/mihomo` 测试容器与临时的 gitignored 配置文件，完整验证切换节点/模式、测速、跨重启流量累加、历史连接落盘等全流程后销毁清理。
+
+---
+
+## 8. Docker 与 Compose
+
+示例 Compose 通过 `./data` 挂载 Mihomo 配置，并通过 `./deck-data` 挂载 Deck 的 SQLite 数据。Mihomo 的 `9090` 默认仅供同网络容器访问，发布该端口会提供一条绕过 Deck 鉴权的直连路径。启动步骤和完整变量表见 [README](../README.md#-快速部署docker-compose)。
+
+| 变量 | 部署行为 |
+| --- | --- |
+| `MIHOMO_URL` | 示例 Compose 默认为 `http://mihomo:9090`，可在 `.env` 中设为网络外可达的控制器地址。独立运行 Go 服务时默认为 `http://127.0.0.1:9090` |
+| `MIHOMO_SECRET` | 默认为空，控制器配置了 `secret` 时填入相同值 |
+| `AUTH_PASSWORD` | Compose 允许留空。复用非空 `users` 表时直接使用数据库中的账号，初始化空表仍由 Go 校验密码 |
+| `JWT_SECRET` | Compose 要求非空，Go 每次启动校验至少 16 字节且避开弱占位值 |
+| `TRUST_PROXY` | 默认为 `false`，部署在可信反向代理之后可设为 `true` |
+| `TRUSTED_PROXIES` | 建议设为实际反向代理的 CIDR 列表。Compose 在变量未设置或为空时传入 `127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`。独立运行 Go 服务且未设置本变量时，仅 `TRUST_PROXY=true` 会使用该列表 |
+
+容器启动时检查 `appuser`（UID/GID `1000`）对 `/data` 的写入和访问权限，必要时调整所有权。应用进程和容器健康探针均以 `appuser` 运行。
+
+本地可用 `docker build -t mihomo-deck:local .` 构建。通过 `--platform` 选择目标平台时，BuildKit 提供 `TARGETOS` 和 `TARGETARCH`，供 Go 设置 `GOOS` 和 `GOARCH`。例如，使用 `docker buildx build --platform linux/arm64 --load -t mihomo-deck:local-arm64 .` 构建 ARM64 镜像。CI 在后端 `go vet`、`go test` 和前端 `npm ci`、`npm run build` 通过后才构建并推送 `linux/amd64` 镜像。

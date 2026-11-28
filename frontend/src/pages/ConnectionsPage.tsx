@@ -6,20 +6,23 @@ import { useLiveStore } from '../stores/useLiveStore';
 import { usePrefsStore } from '../stores/usePrefsStore';
 import { useToastStore } from '../stores/useToastStore';
 import type { ActiveConnection, ClosedConnection, PagedConnections } from '../types/api';
+
+const noConnections: ActiveConnection[] = [];
 export default function ConnectionsPage() {
-  const prefs = usePrefsStore(s => s.prefs);
-  const live = useLiveStore(s => s.connections);
-  const toast = useToastStore();
-  const [tab, setTab] = useState(prefs?.defaultConnectionsTab === 'history' ? 'history' : 'active');
-  const [initialized, setInitialized] = useState(!!prefs);
+  const defaultTab = usePrefsStore(s => s.prefs?.defaultConnectionsTab);
+  const showError = useToastStore(s => s.error);
+  const showSuccess = useToastStore(s => s.success);
+  const [tab, setTab] = useState(defaultTab === 'history' ? 'history' : 'active');
+  const [initialized, setInitialized] = useState(defaultTab !== undefined);
   useEffect(() => {
-    if (prefs && !initialized) {
-      setTab(prefs.defaultConnectionsTab === 'history' ? 'history' : 'active');
+    if (defaultTab !== undefined && !initialized) {
+      setTab(defaultTab === 'history' ? 'history' : 'active');
       setInitialized(true);
     }
-  }, [prefs, initialized]);
+  }, [defaultTab, initialized]);
   const [paused, setPaused] = useState(false);
   const [frozen, setFrozen] = useState<ActiveConnection[]>([]);
+  const live = useLiveStore(s => tab === 'active' && !paused ? s.connections : noConnections);
   const [query, setQuery] = useState('');
   const [range, setRange] = useState('all');
   const [page, setPage] = useState(1);
@@ -29,20 +32,28 @@ export default function ConnectionsPage() {
   const [revision, setRevision] = useState(0);
   useEffect(() => {
     if (tab !== 'history') return;
+    const controller = new AbortController();
+    const { signal } = controller;
     const seconds = Number(range);
+    setHistory(null);
     void api.connections({
       q: query,
       from: seconds ? Math.floor(Date.now() / 1000) - seconds : undefined,
       page,
       pageSize: 30
-    }).then(setHistory).catch(() => toast.error('加载历史连接失败'));
-  }, [tab, query, range, page, revision]);
+    }, signal).then(result => {
+      if (!signal.aborted) setHistory(result);
+    }).catch(() => {
+      if (!signal.aborted) showError('加载历史连接失败');
+    });
+    return () => controller.abort();
+  }, [tab, query, range, page, revision, showError]);
   const entries = (paused ? frozen : live).filter(c => JSON.stringify([c.metadata.host, c.metadata.destinationIP, c.metadata.sourceIP, c.chains, c.rule]).toLowerCase().includes(query.toLowerCase()));
   const run = (fn: () => Promise<void>) => void fn().then(() => {
-    toast.success('操作完成');
+    showSuccess('操作完成');
     setRevision(v => v + 1);
     setSelected(null);
-  }).catch(() => toast.error('操作失败'));
+  }).catch(() => showError('操作失败'));
   const detail = selected ? (() => {
     if ('metadata' in selected) return {host:selected.metadata.host, dst:`${selected.metadata.destinationIP}:${selected.metadata.destinationPort}`, src:`${selected.metadata.sourceIP}:${selected.metadata.sourcePort}`, network:`${selected.metadata.network} / ${selected.metadata.type}`, inbound:selected.metadata.inboundName, chains:selected.chains, up:selected.upload, down:selected.download, start:selected.start ? new Date(selected.start).toLocaleString('zh-CN') : '—', closed:'—', duration:selected.start ? formatDuration(Math.max(0, Date.now() - new Date(selected.start).getTime())) : '—'};
     let chains: string[] = []; try { const parsed: unknown = JSON.parse(selected.chainJson); if (Array.isArray(parsed)) chains = parsed.map(String); } catch { /* 无法解析代理链 */ }

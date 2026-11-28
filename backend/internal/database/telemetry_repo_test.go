@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -32,7 +33,7 @@ func TestTrafficResetAndAverage(t *testing.T) {
 	if up != 105 || down != 230 || avg != 2 {
 		t.Fatalf("got %d %d %d", up, down, avg)
 	}
-	summary, err := GetTrafficSummary(db, now)
+	summary, err := GetTrafficSummary(context.Background(), db, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func TestTrafficTotalsBatchAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	totals := []TrafficTotal{{100, 200}, {150, 250}, {5, 20}, {10, 30}}
+	totals := []TrafficTotal{{Up: 100, Down: 200}, {Up: 150, Down: 250}, {Up: 5, Down: 20}, {Up: 10, Down: 30}}
 	if err = RecordTrafficTotalsBatch(db, []TrafficSample{{TS: now.Unix(), UpBPS: 9}}, totals, now); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestTrafficTotalsBatchAndRollback(t *testing.T) {
 	if _, err = db.Exec(`CREATE TRIGGER reject_cursor BEFORE UPDATE ON traffic_cursor BEGIN SELECT RAISE(ABORT, 'rejected'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if err = RecordTrafficTotalsBatch(db, []TrafficSample{{TS: now.Unix() + 1}}, []TrafficTotal{{20, 40}}, now); err == nil {
+	if err = RecordTrafficTotalsBatch(db, []TrafficSample{{TS: now.Unix() + 1}}, []TrafficTotal{{Up: 20, Down: 40}}, now); err == nil {
 		t.Fatal("expected failure")
 	}
 	var count int
@@ -86,7 +87,7 @@ func TestQueryConnectionsSearchesRule(t *testing.T) {
 	if err = InsertClosedConnections(db, []ClosedConnection{{ID: "a", Rule: "DOMAIN-SUFFIX"}, {ID: "b", Rule: "MATCH"}}); err != nil {
 		t.Fatal(err)
 	}
-	result, err := QueryConnections(db, ConnectionFilter{Q: "SUFFIX"})
+	result, err := QueryConnections(context.Background(), db, ConnectionFilter{Q: "SUFFIX"})
 	if err != nil || result.Total != 1 || len(result.Items) != 1 || result.Items[0].ID != "a" {
 		t.Fatalf("result %+v: %v", result, err)
 	}

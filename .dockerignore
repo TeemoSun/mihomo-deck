@@ -1,5 +1,13 @@
 .git
+.github
 .env
+**/.env
+**/.env.*
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/.tmp
+**/*.log
 data
 deck-data
 frontend/node_modules

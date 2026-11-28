@@ -22,7 +22,17 @@ type Client struct {
 }
 
 func NewClient(baseURL, secret string) *Client {
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), secret: secret, httpClient: &http.Client{Timeout: 30 * time.Second}, wsDialer: websocket.DefaultDialer}
+	return &Client{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		secret:  secret,
+		httpClient: &http.Client{
+			Timeout: 65 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		wsDialer: websocket.DefaultDialer,
+	}
 }
 func (c *Client) request(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(body))
@@ -40,9 +50,14 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 		return nil, &UpstreamError{Err: err}
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	const maxBody = 32 << 20
+	// Read one extra byte to distinguish an oversized response from an exact fit.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Err: err}
+	}
+	if len(data) > maxBody {
+		return nil, &UpstreamError{Err: fmt.Errorf("response exceeds %d bytes", maxBody)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &UpstreamError{StatusCode: resp.StatusCode, Body: data}
@@ -80,6 +95,11 @@ func (c *Client) SelectProxy(ctx context.Context, group, node string) (json.RawM
 func (c *Client) UnfixProxy(ctx context.Context, group string) (json.RawMessage, error) {
 	return c.request(ctx, http.MethodDelete, "/proxies/"+url.PathEscape(group), nil)
 }
+func ValidDelayTestURL(value string) bool {
+	u, err := url.Parse(value)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != ""
+}
+
 func delayQuery(testURL string, timeout int) string {
 	v := url.Values{}
 	v.Set("url", testURL)

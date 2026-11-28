@@ -15,8 +15,8 @@ type TrafficSample struct {
 }
 
 type TrafficTotal struct {
-	Up   int64
-	Down int64
+	Up, Down   int64
+	ObservedAt int64
 }
 
 func RecordTrafficBatch(db *sql.DB, samples []TrafficSample, up, down int64, hasTotals bool, now time.Time) error {
@@ -68,7 +68,10 @@ func RecordTrafficTotalsBatch(db *sql.DB, samples []TrafficSample, totals []Traf
 				dd = down - lastDown
 			}
 		}
-		ts := now.Unix()
+		ts := total.ObservedAt
+		if ts == 0 {
+			ts = now.Unix()
+		}
 		if _, err = tx.Exec(`INSERT INTO traffic_cursor VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET last_up_total=excluded.last_up_total,last_down_total=excluded.last_down_total,cumulative_up=excluded.cumulative_up,cumulative_down=excluded.cumulative_down,updated_at=excluded.updated_at`, up, down, cumUp+du, cumDown+dd, ts); err != nil {
 			return err
 		}
@@ -85,8 +88,11 @@ func PruneTelemetry(db *sql.DB, days int, now time.Time) error {
 		return err
 	}
 	defer tx.Rollback()
-	cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).Unix()
-	for _, q := range []string{"DELETE FROM traffic_samples WHERE ts<?", "DELETE FROM traffic_hourly WHERE hour_ts<?", "DELETE FROM connection_history WHERE closed_at<?", "DELETE FROM log_entries WHERE ts<?", "DELETE FROM delay_history WHERE tested_at<?", "DELETE FROM provider_snapshots WHERE captured_at<?"} {
+	cutoff := now.Unix() - int64(days)*86400
+	if _, err = tx.Exec("DELETE FROM traffic_hourly WHERE hour_ts<?", cutoff-cutoff%3600); err != nil {
+		return err
+	}
+	for _, q := range []string{"DELETE FROM traffic_samples WHERE ts<?", "DELETE FROM connection_history WHERE closed_at<?", "DELETE FROM log_entries WHERE ts<?", "DELETE FROM delay_history WHERE tested_at<?", "DELETE FROM provider_snapshots WHERE captured_at<?"} {
 		if _, err = tx.Exec(q, cutoff); err != nil {
 			return err
 		}

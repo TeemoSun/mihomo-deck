@@ -26,3 +26,20 @@ func TestEscapingAndUpstreamError(t *testing.T) {
 		t.Fatalf("error: %v", err)
 	}
 }
+
+func TestClientRejectsRedirects(t *testing.T) {
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("redirect target was contacted")
+	}))
+	defer redirected.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirected.URL, http.StatusTemporaryRedirect)
+	}))
+	defer upstream.Close()
+
+	_, err := NewClient(upstream.URL, "test-secret").Version(context.Background())
+	var upstreamErr *UpstreamError
+	if !errors.As(err, &upstreamErr) || upstreamErr.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("redirect returned %v", err)
+	}
+}
