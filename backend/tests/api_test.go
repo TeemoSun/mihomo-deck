@@ -454,29 +454,48 @@ func TestLiveTrafficStream(t *testing.T) {
 			header.Add("Cookie", cookie.String())
 		}
 	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(c.Snapshot().LiveTrafficHistory) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("collector did not receive live traffic")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/api/ws/live", header)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	found := false
-	for !found {
-		var event struct {
-			Type string          `json:"type"`
-			Data json.RawMessage `json:"data"`
-		}
+	var event struct {
+		Type string          `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err = conn.ReadJSON(&event); err != nil {
+		t.Fatal(err)
+	}
+	var init struct {
+		LiveTrafficHistory []database.TrafficSample `json:"liveTrafficHistory"`
+	}
+	if event.Type != "init" || json.Unmarshal(event.Data, &init) != nil || len(init.LiveTrafficHistory) == 0 {
+		t.Fatalf("init event %+v", event)
+	}
+	last := init.LiveTrafficHistory[len(init.LiveTrafficHistory)-1]
+	if last.TS == 0 || last.UpBPS != 123 || last.DownBPS != 456 {
+		t.Fatalf("init live sample %+v", last)
+	}
+	for {
 		if err = conn.ReadJSON(&event); err != nil {
 			t.Fatal(err)
 		}
 		if event.Type == "traffic" {
-			var traffic struct {
-				Up int `json:"up"`
-			}
-			if json.Unmarshal(event.Data, &traffic) != nil || traffic.Up != 123 {
+			var traffic collector.TrafficBroadcast
+			if json.Unmarshal(event.Data, &traffic) != nil || traffic.Up != 123 || traffic.Down != 456 ||
+				traffic.TS < last.TS || traffic.Sample.TS != traffic.TS ||
+				traffic.Sample.UpBPS != traffic.Up || traffic.Sample.DownBPS != traffic.Down {
 				t.Fatalf("event %s", event.Data)
 			}
-			found = true
+			break
 		}
 	}
 }

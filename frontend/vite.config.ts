@@ -9,6 +9,16 @@ export default defineConfig({
       '@': new URL('./src', import.meta.url).pathname,
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom/client'],
+          charts: ['recharts'],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       '/api': {

@@ -9,6 +9,7 @@ interface State {
   traffic: { up: number; down: number }
   memory: { inuse: number; oslimit: number }
   samples: TrafficSample[]
+  liveSync: { serverTs: number; syncedAtMs: number } | null
   connections: ActiveConnection[]
   logs: LogEntry[]
   logsPaused: boolean
@@ -23,14 +24,25 @@ const initialLiveData = {
   traffic: { up: 0, down: 0 },
   memory: { inuse: 0, oslimit: 0 },
   samples: [],
+  liveSync: null,
   connections: [],
   logs: [],
   logsPaused: false,
 }
 
-const nowSeconds = () => Math.floor(Date.now() / 1000)
-const recentSamples = (samples: TrafficSample[], now = nowSeconds()) =>
-  samples.filter(sample => sample.ts > now - 60).slice(-60)
+const nowSeconds = (nowMs = Date.now()) => Math.floor(nowMs / 1000)
+
+function recentSamples(samples: TrafficSample[], windowEnd: number) {
+  const byTs = new Map<number, TrafficSample>()
+  for (const sample of samples) {
+    if (sample.ts > windowEnd - 60 && sample.ts <= windowEnd) byTs.set(sample.ts, sample)
+  }
+  return [...byTs.values()].sort((a, b) => a.ts - b.ts).slice(-60)
+}
+
+function upsertSample(samples: TrafficSample[], sample: TrafficSample, windowEnd: number) {
+  return recentSamples([...samples, sample], windowEnd)
+}
 
 export const useLiveStore = create<State>((set, get) => {
   let socket: WebSocket | null = null
@@ -86,29 +98,46 @@ export const useLiveStore = create<State>((set, get) => {
           return
         }
         switch (event.type) {
-          case 'init':
+          case 'init': {
+            const { status, traffic, memory, connections, logs } = event.data
+            const liveHistory = event.data.liveTrafficHistory ?? []
+            const trafficHistory = event.data.trafficHistory ?? []
+            const syncedAtMs = Date.now()
+            const serverTs = Math.max(
+              status?.lastSeenAt ?? 0,
+              ...liveHistory.map(sample => sample.ts),
+              ...trafficHistory.map(sample => sample.ts),
+            ) || nowSeconds(syncedAtMs)
             set(state => ({
-              status: event.data.status,
-              traffic: event.data.traffic,
-              memory: event.data.memory,
-              connections: event.data.connections.connections ?? [],
-              samples: recentSamples(event.data.trafficHistory ?? []),
-              logs: state.logsPaused ? state.logs : (event.data.logs ?? []).slice(-500),
+              status,
+              traffic,
+              memory,
+              connections: connections.connections ?? [],
+              samples: recentSamples(liveHistory.length ? liveHistory : trafficHistory, serverTs),
+              liveSync: { serverTs, syncedAtMs },
+              logs: state.logsPaused ? state.logs : (logs ?? []).slice(-500),
             }))
             break
+          }
           case 'traffic': {
-            const { samples, memory, connections } = get()
-            const ts = nowSeconds()
+            const { samples, memory, connections, liveSync } = get()
+            const { up, down } = event.data
+            const syncedAtMs = Date.now()
+            const ts = event.data.ts ?? event.data.sample?.ts ?? (liveSync
+              ? liveSync.serverTs + Math.max(0, Math.floor((syncedAtMs - liveSync.syncedAtMs) / 1000))
+              : nowSeconds(syncedAtMs))
+            const sample = event.data.sample ?? {
+              ts,
+              upBps: up,
+              downBps: down,
+              memInuse: memory.inuse,
+              memOslimit: memory.oslimit,
+              activeConns: connections.length,
+            }
             set({
-              traffic: event.data,
-              samples: recentSamples([...samples, {
-                ts,
-                upBps: event.data.up,
-                downBps: event.data.down,
-                memInuse: memory.inuse,
-                memOslimit: memory.oslimit,
-                activeConns: connections.length,
-              }], ts),
+              traffic: { up, down },
+              samples: upsertSample(samples, sample, ts),
+              liveSync: { serverTs: ts, syncedAtMs },
             })
             break
           }

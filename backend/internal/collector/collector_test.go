@@ -76,6 +76,87 @@ func TestNewPreloadsLatestTrafficHistory(t *testing.T) {
 	}
 }
 
+func TestUpsertLiveSample(t *testing.T) {
+	const windowEnd int64 = 1000
+	const replacedTS int64 = 980
+	var history []database.TrafficSample
+	for ts := windowEnd - 61; ts < windowEnd; ts++ {
+		if ts != replacedTS {
+			history = append(history, database.TrafficSample{TS: ts})
+		}
+	}
+	history = upsertLiveSample(history, database.TrafficSample{TS: windowEnd}, windowEnd)
+	history = upsertLiveSample(history, database.TrafficSample{TS: replacedTS, UpBPS: 10}, windowEnd)
+	replacement := database.TrafficSample{TS: replacedTS, DownBPS: 20}
+	history = upsertLiveSample(history, replacement, windowEnd)
+	if len(history) != 60 {
+		t.Fatalf("live history length = %d, want 60", len(history))
+	}
+	for i, sample := range history {
+		if want := windowEnd - 59 + int64(i); sample.TS != want {
+			t.Fatalf("sample %d timestamp = %d, want %d", i, sample.TS, want)
+		}
+		if sample.TS == replacedTS && sample != replacement {
+			t.Fatalf("replacement = %+v, want %+v", sample, replacement)
+		}
+	}
+	// A clock step backwards can leave more than 60 timestamps above the cutoff.
+	history = upsertLiveSample(history, database.TrafficSample{TS: windowEnd - 60}, windowEnd-1)
+	if len(history) != 60 || history[0].TS != windowEnd-59 {
+		t.Fatalf("capped history = %+v", history)
+	}
+}
+
+func TestConsumeTrafficUpdatesLiveHistoryBeforeFlush(t *testing.T) {
+	db, err := database.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	c := New(db, nil, database.DefaultPreferences(30, 30, "info"))
+	now := time.Now().Unix()
+	recent := database.TrafficSample{TS: now - 5, UpBPS: 7}
+	c.state.LiveTrafficHistory = []database.TrafficSample{{TS: now - 60}, recent}
+	c.consume("memory", json.RawMessage(`{"inuse":100,"oslimit":200}`))
+	c.consume("connections", json.RawMessage(`{"uploadTotal":0,"downloadTotal":0,"connections":[{"id":"active"}]}`))
+	events, unsubscribe := c.Subscribe()
+	defer unsubscribe()
+	c.consume("traffic", json.RawMessage(`{"up":12,"down":34}`))
+
+	snapshot := c.Snapshot()
+	want := database.TrafficSample{TS: snapshot.Status.LastSeenAt, UpBPS: 12, DownBPS: 34, MemInuse: 100, MemOslimit: 200, ActiveConns: 1}
+	if history := snapshot.LiveTrafficHistory; len(history) != 2 || history[0] != recent || history[1] != want {
+		t.Fatalf("live history = %+v, want %+v then %+v", history, recent, want)
+	}
+	select {
+	case event := <-events:
+		if event.Type != "traffic" || event.Data != (TrafficBroadcast{Up: 12, Down: 34, TS: want.TS, Sample: want}) {
+			t.Fatalf("traffic event = %+v", event)
+		}
+	default:
+		t.Fatal("traffic event missing")
+	}
+	snapshot.LiveTrafficHistory[1].UpBPS = 0
+	if got := c.Snapshot().LiveTrafficHistory[1]; got != want {
+		t.Fatalf("snapshot mutated collector sample: %+v", got)
+	}
+	if len(snapshot.TrafficHistory) != 0 {
+		t.Fatal("traffic consume updated persisted history")
+	}
+	c.flush()
+	if len(c.Snapshot().TrafficHistory) != 0 {
+		t.Fatal("disconnected flush updated persisted history")
+	}
+	c.setStatus("traffic", true, nil)
+	c.flush()
+	if history := c.Snapshot().TrafficHistory; len(history) != 1 || history[0].UpBPS != want.UpBPS {
+		t.Fatalf("persisted history after connected flush = %+v", history)
+	}
+}
+
 func TestSchedulerCapturePersistsProviderAndScheduledDelay(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

@@ -1,7 +1,7 @@
-import { useEffect, useReducer, useState } from 'react';
+import { useEffect, useMemo, useReducer, useState } from 'react';
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api } from '../api/client';
-import type { OverviewResponse, TrafficPoint, ProxyItem, ProviderSnapshot } from '../types/api';
+import type { OverviewResponse, TrafficPoint, TrafficSample, ProxyItem, ProviderSnapshot } from '../types/api';
 import { usePrefsStore } from '../stores/usePrefsStore';
 import { useLiveStore } from '../stores/useLiveStore';
 import { useToastStore } from '../stores/useToastStore';
@@ -9,23 +9,60 @@ import { formatBytes, formatSpeed, formatRelative, formatUnixTime } from '../lib
 import { Badge, Button, Card, EmptyState, Modal, Select, Tabs } from '../components/ui';
 import { useHistoryDialog } from '../hooks/useHistoryDialog';
 import ModeSwitcher from '../components/ModeSwitcher';
+
+type ChartPoint = {
+  ts: number;
+  memInuse: number | null;
+  downBps?: number | null;
+  upBps?: number | null;
+  downBytes?: number | null;
+  upBytes?: number | null;
+};
+
+function historicalPoints(items: Array<TrafficSample & Partial<TrafficPoint>>, gapThreshold: number, hourly: boolean): ChartPoint[] {
+  const points: ChartPoint[] = [];
+  for (const [i, p] of items.entries()) {
+    const prev = items[i - 1];
+    if (prev && p.ts - prev.ts > gapThreshold) {
+      const ts = prev.ts + 1;
+      points.push(hourly
+        ? { ts, downBytes: null, upBytes: null, memInuse: null }
+        : { ts, downBps: null, upBps: null, memInuse: null });
+    }
+    points.push(hourly
+      ? { ts: p.ts, downBytes: p.downBytes ?? 0, upBytes: p.upBytes ?? 0, memInuse: p.avgMem ?? 0 }
+      : { ts: p.ts, downBps: p.downBps, upBps: p.upBps, memInuse: p.memInuse });
+  }
+  return points;
+}
+
 export default function OverviewPage() {
   const [data, setData] = useState<OverviewResponse | null>(null);
   const [range, setRange] = useState('live');
   const [chart, setChart] = useState('network');
+  const [tickMs, setTickMs] = useState(Date.now);
   const [series, setSeries] = useState<{ range: string; items: TrafficPoint[] } | null>(null);
   const [proxies, setProxies] = useState<Record<string, ProxyItem>>({});
   const [revision, load] = useReducer(n => n + 1, 0);
+  const isLive = range === 'live';
+  const hourly = range === '7d' || range === '30d';
   const { history, openHistory, closeHistory } = useHistoryDialog<ProviderSnapshot>();
   const hiddenGroups = usePrefsStore(s => s.prefs?.hiddenGroups);
   const autoRefresh = usePrefsStore(s => s.prefs?.autoRefreshOverview);
-  const samples = useLiveStore(s => range === 'live' ? s.samples : null);
+  const samples = useLiveStore(s => isLive ? s.samples : null);
+  const liveSync = useLiveStore(s => isLive ? s.liveSync : null);
   const traffic = useLiveStore(s => s.traffic);
   const memory = useLiveStore(s => s.memory);
   const connectionCount = useLiveStore(s => s.connections.length);
   const status = useLiveStore(s => s.status);
   const showSuccess = useToastStore(s => s.success);
   const showError = useToastStore(s => s.error);
+  useEffect(() => {
+    if (!isLive) return;
+    setTickMs(Date.now());
+    const id = setInterval(() => setTickMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [isLive]);
   useEffect(() => {
     if (autoRefresh === false) return;
     const id = setInterval(load, 60000);
@@ -51,12 +88,33 @@ export default function OverviewPage() {
     }
     return () => controller.abort();
   }, [range, revision, showError]);
-  const points = range === 'live' ? (samples ?? []) : (series?.range === range ? series.items : []).map(p => ({
-    ...p,
-    upBps: p.upBps || p.peakUpBps,
-    downBps: p.downBps || p.peakDownBps,
-    memInuse: p.memInuse || p.avgMem
-  }));
+  const endTs = Math.max(
+    liveSync
+      ? liveSync.serverTs + Math.max(0, Math.floor((tickMs - liveSync.syncedAtMs) / 1000))
+      : Math.floor(tickMs / 1000),
+    samples?.at(-1)?.ts ?? -Infinity,
+  );
+  const startTs = endTs - 59;
+  const points = useMemo(() => {
+    if (!isLive) {
+      if (series?.range !== range) return [];
+      const gapThreshold = hourly ? 5400 : range === '1h' ? 30 : 900;
+      return historicalPoints(series.items, gapThreshold, hourly);
+    }
+    if (!samples?.length) return [];
+    return historicalPoints(samples.filter(sample => sample.ts >= startTs && sample.ts <= endTs), 3, false);
+  }, [isLive, hourly, range, series, samples, startTs, endTs]);
+  const liveTicks = isLive
+    ? Array.from({ length: 60 }, (_, i) => startTs + i).filter(ts => ts % 10 === 0)
+    : undefined;
+  const formatChartTick = (ts: number) => {
+    const date = new Date(ts * 1000);
+    const time = date.toLocaleTimeString('zh-CN', {
+      hour: '2-digit', minute: '2-digit', second: isLive ? '2-digit' : undefined, hour12: false,
+    });
+    return hourly ? `${date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${time}` : time;
+  };
+  const formatChartValue = chart === 'network' && !hourly ? formatSpeed : formatBytes;
   const sum = data?.trafficSummary;
   const groups = Object.values(proxies).filter(p => ['Selector', 'URLTest'].includes(p.type) && p.all?.length && !(hiddenGroups ?? []).includes(p.name) && (p.name !== 'GLOBAL' || data?.configs?.mode?.toLowerCase() === 'global')).sort((a, b) => Number(b.type === 'Selector') - Number(a.type === 'Selector'));
   const stats = data?.topStats;
@@ -105,23 +163,22 @@ export default function OverviewPage() {
         }]} />
         </div>
         <div className="mb-2 text-xs text-zinc-500">
-          {chart === 'memory' ? '内存占用' : ['7d', '30d'].includes(range) ? '下载流量 · 上传流量（每小时）' : '下载速率 · 上传速率'}
+          {chart === 'memory' ? '内存占用' : hourly ? '下载流量 · 上传流量（每小时）' : '下载速率 · 上传速率'}
         </div>
         <div className="h-64">
           {points.length ? <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={points}>
               <CartesianGrid strokeDasharray="3 3" strokeOpacity={0.12} />
-              <XAxis dataKey="ts" tickFormatter={v => (['7d', '30d'].includes(range) ? new Date(v * 1000).toLocaleDateString('zh-CN', {month:'2-digit', day:'2-digit'}) + ' ' : '') + new Date(v * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit', hour12:false})} tick={{
-              fontSize: 10
-            }} minTickGap={35} />
-              <YAxis tickFormatter={chart === 'network' && !['7d', '30d'].includes(range) ? formatSpeed : formatBytes} tick={{
-              fontSize: 10
-            }} width={70} />
-              <Tooltip labelFormatter={v => formatUnixTime(Number(v))} formatter={(v, name) => [chart === 'network' && !['7d', '30d'].includes(range) ? formatSpeed(Number(v)) : formatBytes(Number(v)), name]} />
+              <XAxis dataKey="ts" type="number" scale="time" allowDataOverflow
+                domain={isLive ? [startTs, endTs] : ['dataMin', 'dataMax']} ticks={liveTicks}
+                tickFormatter={formatChartTick} tick={{ fontSize: 10 }} minTickGap={35} />
+              <YAxis tickFormatter={formatChartValue} tick={{ fontSize: 10 }} width={70} />
+              <Tooltip filterNull={false} labelFormatter={v => formatUnixTime(Number(v))}
+                formatter={(v, name) => [v == null ? '—' : formatChartValue(Number(v)), name]} />
               {chart === 'network' ? <>
-                <Area type="monotone" dataKey={['7d', '30d'].includes(range) ? 'downBytes' : 'downBps'} name={['7d', '30d'].includes(range) ? '下载流量' : '下载速率'} stroke="#6366f1" fill="#6366f1" fillOpacity={0.12} />
-                <Area type="monotone" dataKey={['7d', '30d'].includes(range) ? 'upBytes' : 'upBps'} name={['7d', '30d'].includes(range) ? '上传流量' : '上传速率'} stroke="#10b981" fill="#10b981" fillOpacity={0.08} />
-              </> : <Area type="monotone" dataKey="memInuse" name="内存占用" stroke="#f59e0b" fill="#f59e0b" fillOpacity={0.1} />}
+                <Area type="linear" isAnimationActive={false} connectNulls={false} dataKey={hourly ? 'downBytes' : 'downBps'} name={hourly ? '下载流量' : '下载速率'} stroke="#6366f1" fill="#6366f1" fillOpacity={0.12} />
+                <Area type="linear" isAnimationActive={false} connectNulls={false} dataKey={hourly ? 'upBytes' : 'upBps'} name={hourly ? '上传流量' : '上传速率'} stroke="#10b981" fill="#10b981" fillOpacity={0.08} />
+              </> : <Area type="linear" isAnimationActive={false} connectNulls={false} dataKey="memInuse" name="内存占用" stroke="#f59e0b" fill="#f59e0b" fillOpacity={0.1} />}
             </AreaChart>
           </ResponsiveContainer> : <EmptyState>暂无曲线数据</EmptyState>}
         </div>

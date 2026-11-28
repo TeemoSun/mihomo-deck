@@ -8,6 +8,7 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -23,6 +24,12 @@ type Event struct {
 type Traffic struct {
 	Up   int64 `json:"up"`
 	Down int64 `json:"down"`
+}
+type TrafficBroadcast struct {
+	Up     int64                  `json:"up"`
+	Down   int64                  `json:"down"`
+	TS     int64                  `json:"ts"`
+	Sample database.TrafficSample `json:"sample"`
 }
 type Memory struct {
 	Inuse   int64 `json:"inuse"`
@@ -67,12 +74,13 @@ type Status struct {
 	Streams    map[string]StreamStatus `json:"streams"`
 }
 type State struct {
-	Status         Status                   `json:"status"`
-	Traffic        Traffic                  `json:"traffic"`
-	Memory         Memory                   `json:"memory"`
-	Connections    ConnectionsSnapshot      `json:"connections"`
-	TrafficHistory []database.TrafficSample `json:"trafficHistory"`
-	Logs           []database.LogEntry      `json:"logs"`
+	Status             Status                   `json:"status"`
+	Traffic            Traffic                  `json:"traffic"`
+	Memory             Memory                   `json:"memory"`
+	Connections        ConnectionsSnapshot      `json:"connections"`
+	TrafficHistory     []database.TrafficSample `json:"trafficHistory"`
+	LiveTrafficHistory []database.TrafficSample `json:"liveTrafficHistory"`
+	Logs               []database.LogEntry      `json:"logs"`
 }
 type Collector struct {
 	db          *sql.DB
@@ -148,6 +156,7 @@ func (c *Collector) snapshotLocked() State {
 	s := c.state
 	s.Status.Streams = maps.Clone(s.Status.Streams)
 	s.TrafficHistory = slices.Clone(s.TrafficHistory)
+	s.LiveTrafficHistory = slices.Clone(s.LiveTrafficHistory)
 	s.Logs = slices.Clone(s.Logs)
 	s.Connections.Connections = slices.Clone(s.Connections.Connections)
 	for i := range s.Connections.Connections {
@@ -309,6 +318,18 @@ func (c *Collector) setStatus(path string, connected bool, err error) {
 		c.once.Do(func() { c.initial <- struct{}{} })
 	}
 }
+
+func upsertLiveSample(history []database.TrafficSample, sample database.TrafficSample, windowEnd int64) []database.TrafficSample {
+	index := sort.Search(len(history), func(i int) bool { return history[i].TS >= sample.TS })
+	if index < len(history) && history[index].TS == sample.TS {
+		history[index] = sample
+	} else {
+		history = slices.Insert(history, index, sample)
+	}
+	first := sort.Search(len(history), func(i int) bool { return history[i].TS > windowEnd-60 })
+	return newest(history[first:], 60)
+}
+
 func (c *Collector) consume(path string, raw json.RawMessage) {
 	now := time.Now()
 	c.mu.Lock()
@@ -317,8 +338,18 @@ func (c *Collector) consume(path string, raw json.RawMessage) {
 	case "traffic":
 		var v Traffic
 		if json.Unmarshal(raw, &v) == nil {
+			nowUnix := now.Unix()
 			c.state.Traffic = v
-			c.broadcast(path, v)
+			sample := database.TrafficSample{
+				TS:          nowUnix,
+				UpBPS:       v.Up,
+				DownBPS:     v.Down,
+				MemInuse:    c.state.Memory.Inuse,
+				MemOslimit:  c.state.Memory.Oslimit,
+				ActiveConns: int64(len(c.active)),
+			}
+			c.state.LiveTrafficHistory = upsertLiveSample(c.state.LiveTrafficHistory, sample, nowUnix)
+			c.broadcast(path, TrafficBroadcast{Up: v.Up, Down: v.Down, TS: nowUnix, Sample: sample})
 		}
 	case "memory":
 		var v Memory
